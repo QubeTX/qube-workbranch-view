@@ -9,6 +9,7 @@ pub mod cli;
 pub mod git;
 pub mod live;
 pub mod process;
+pub mod storage;
 pub mod terminal;
 pub mod ui;
 pub mod util;
@@ -21,6 +22,10 @@ use cli::{Cli, Command};
 use color_eyre::eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
+
+/// Keep archived events for 30 days, capped to this many (handoff §18 "archive").
+const ARCHIVE_KEEP_SECS: u64 = 30 * 86_400;
+const ARCHIVE_MAX: usize = 2000;
 
 /// Run wb300: dispatch any subcommand, otherwise launch the live TUI.
 pub async fn run(cli: Cli) -> Result<()> {
@@ -49,6 +54,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             std::process::exit(2);
         }
     };
+
+    init_logging(&repo);
 
     let snapshot = git::RepoSnapshot::capture(repo).await?;
 
@@ -80,6 +87,16 @@ async fn run_loop(
 ) -> Result<()> {
     let repo = snapshot.repo.clone();
     let mut app = AppState::new(snapshot);
+
+    // Load + prune (age + cap) the persisted Timeline, then keep one writer
+    // thread that owns the file for ordered, non-interleaved appends.
+    let events_path = app.snapshot.repo.state_dir().join("events.jsonl");
+    app.set_events(storage::event_store::prune(
+        &events_path,
+        ARCHIVE_KEEP_SECS,
+        ARCHIVE_MAX,
+    ));
+    let event_writer = storage::event_store::spawn_writer(events_path);
 
     // The capture channel carries Option: None means a capture failed, so the
     // loop still resets `in_flight` and never wedges the live engine.
@@ -142,7 +159,9 @@ async fn run_loop(
             Some(result) = snap_rx.recv() => {
                 in_flight = false;
                 if let Some(snapshot) = result {
-                    app.ingest_snapshot(snapshot);
+                    for event in app.ingest_snapshot(snapshot) {
+                        let _ = event_writer.send(event);
+                    }
                 }
             }
         }
@@ -164,6 +183,29 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+/// Best-effort: route `tracing` diagnostics to `<state_dir>/wb300.log` so
+/// warnings (watcher/archive failures) are observable without corrupting the TUI.
+fn init_logging(repo: &git::RepoIdentity) {
+    let dir = repo.state_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("wb300.log"))
+    else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("wb300=warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .try_init();
 }
 
 /// Paths the filesystem watcher should watch: the repo root and every linked

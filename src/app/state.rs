@@ -1,12 +1,16 @@
 //! The application state and its reducer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::action::Action;
 use super::transitions::{TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
+use crate::storage::{ArchivedEvent, DirtySummary, EventKind};
+
+/// In-memory cap on archived events (matches the on-disk prune cap).
+const MAX_ARCHIVE: usize = 2000;
 
 /// Top-level views. Mirrors the design's tab set; Timeline arrives with the
 /// event archive in a later phase (handoff §14.2).
@@ -17,17 +21,19 @@ pub enum Tab {
     Processes,
     Collisions,
     Cleanup,
+    Timeline,
     Help,
 }
 
 impl Tab {
     /// All tabs, in display order.
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Worktrees,
         Tab::Processes,
         Tab::Collisions,
         Tab::Cleanup,
+        Tab::Timeline,
         Tab::Help,
     ];
 
@@ -39,6 +45,7 @@ impl Tab {
             Tab::Processes => "Processes",
             Tab::Collisions => "Collisions",
             Tab::Cleanup => "Cleanup",
+            Tab::Timeline => "Timeline",
             Tab::Help => "Help",
         }
     }
@@ -90,6 +97,8 @@ pub struct AppState {
     pending_refresh: bool,
     /// Whether live updating is active (for the header indicator).
     pub live: LiveStatus,
+    /// Archived structural events (newest first, capped) — the Timeline.
+    pub archive: VecDeque<ArchivedEvent>,
 }
 
 impl AppState {
@@ -105,6 +114,7 @@ impl AppState {
             transitions: Transitions::default(),
             pending_refresh: false,
             live: LiveStatus::Static,
+            archive: VecDeque::new(),
         }
     }
 
@@ -119,32 +129,64 @@ impl AppState {
         }
     }
 
-    /// Diff the new snapshot against the current one to raise transient
-    /// highlights, then swap it in. Used by both manual refresh and the live engine.
-    pub fn ingest_snapshot(&mut self, new: RepoSnapshot) {
-        let notes = {
+    /// Replace the archive (loaded at startup). On disk events are oldest-first;
+    /// we store them newest-first for display, capped to [`MAX_ARCHIVE`].
+    pub fn set_events(&mut self, events: Vec<ArchivedEvent>) {
+        self.archive = events.into_iter().rev().collect();
+        self.truncate_archive();
+    }
+
+    /// Cap the in-memory archive to the most recent [`MAX_ARCHIVE`] events.
+    fn truncate_archive(&mut self) {
+        while self.archive.len() > MAX_ARCHIVE {
+            self.archive.pop_back();
+        }
+    }
+
+    /// Diff the new snapshot against the current one: raise transient highlights,
+    /// record created/removed worktrees in the archive, swap the snapshot in, and
+    /// return the newly-detected events for the caller to persist.
+    pub fn ingest_snapshot(&mut self, new: RepoSnapshot) -> Vec<ArchivedEvent> {
+        let mut new_events: Vec<ArchivedEvent> = Vec::new();
+        let mut notes: Vec<(String, TransitionKind)> = Vec::new();
+        {
             let previous: HashMap<&str, &WorktreeRecord> = self
                 .snapshot
                 .worktrees
                 .iter()
                 .map(|wt| (wt.path.as_str(), wt))
                 .collect();
-            let mut notes: Vec<(String, TransitionKind)> = Vec::new();
             for wt in &new.worktrees {
                 match previous.get(wt.path.as_str()) {
-                    None => notes.push((wt.path.clone(), TransitionKind::Created)),
+                    None => {
+                        notes.push((wt.path.clone(), TransitionKind::Created));
+                        new_events.push(event_from(EventKind::WorktreeCreated, wt));
+                    }
                     Some(old) if dirty_summary(old) != dirty_summary(wt) => {
                         notes.push((wt.path.clone(), TransitionKind::Modified));
                     }
                     Some(_) => {}
                 }
             }
-            notes
-        };
+            let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
+            for old in &self.snapshot.worktrees {
+                if !old.bare && !incoming.contains(old.path.as_str()) {
+                    notes.push((old.path.clone(), TransitionKind::Deleted));
+                    new_events.push(event_from(EventKind::WorktreeRemoved, old));
+                }
+            }
+        }
+
         for (path, kind) in notes {
             self.transitions.note(path, kind);
         }
+        // Prepend so the archive stays newest-first; reverse keeps in-batch order.
+        for event in new_events.iter().rev() {
+            self.archive.push_front(event.clone());
+        }
+        self.truncate_archive();
         self.set_snapshot(new);
+        new_events
     }
 
     /// The active transient highlight for a worktree path, if any.
@@ -197,7 +239,7 @@ impl AppState {
             KeyCode::Char('r') => Action::Refresh,
             KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
             KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 let idx = (c as u8 - b'1') as usize;
                 Action::SelectTab(Tab::ALL[idx])
             }
@@ -231,6 +273,23 @@ impl AppState {
             }
         }
     }
+}
+
+/// Build an [`ArchivedEvent`] from a worktree's last-known state.
+fn event_from(kind: EventKind, wt: &WorktreeRecord) -> ArchivedEvent {
+    let dirty = wt.status.as_ref().map(|s| DirtySummary {
+        staged: s.staged,
+        unstaged: s.unstaged,
+        untracked: s.untracked,
+        conflicted: s.conflicted,
+    });
+    ArchivedEvent::new(
+        kind,
+        wt.path.clone(),
+        wt.branch_short().map(str::to_string),
+        wt.short_head().map(str::to_string),
+        dirty,
+    )
 }
 
 /// The persistent dirty/divergence fingerprint used to detect changes between
@@ -349,5 +408,39 @@ mod tests {
         let mut a = app(0);
         a.apply(Action::MoveDown);
         assert_eq!(a.selected, 0);
+    }
+
+    fn snapshot_paths(paths: &[&str]) -> RepoSnapshot {
+        let worktrees = paths
+            .iter()
+            .map(|p| WorktreeRecord {
+                path: (*p).to_string(),
+                ..Default::default()
+            })
+            .collect();
+        RepoSnapshot {
+            repo: RepoIdentity {
+                start_dir: "/repo".into(),
+                root: "/repo".into(),
+                git_dir: "/repo/.git".into(),
+                common_git_dir: "/repo/.git".into(),
+                is_worktree: false,
+            },
+            worktrees,
+            branches: Vec::new(),
+            processes: ProcessSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn ingest_detects_created_and_removed() {
+        let mut app = AppState::new(snapshot_paths(&["/repo-a", "/repo-b"]));
+        let events = app.ingest_snapshot(snapshot_paths(&["/repo-a", "/repo-c"]));
+        assert_eq!(events.len(), 2);
+        let kinds: Vec<(EventKind, &str)> =
+            events.iter().map(|e| (e.kind, e.path.as_str())).collect();
+        assert!(kinds.contains(&(EventKind::WorktreeCreated, "/repo-c")));
+        assert!(kinds.contains(&(EventKind::WorktreeRemoved, "/repo-b")));
+        assert_eq!(app.archive.len(), 2);
     }
 }

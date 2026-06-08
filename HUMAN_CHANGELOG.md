@@ -33,3 +33,8 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   won't interfere with other apps' file watching. The header shows whether you're in live,
   periodic-only, or static mode, and a hiccup while reading Git can no longer freeze the
   live updates.
+- WB-300 now keeps a timeline. When worktrees are created or removed — even from another
+  terminal — it notices, flashes the change, and records it to a history you can browse in the
+  new Timeline tab; that history survives restarts. It's kept tidy automatically (trimmed by
+  age and size), written safely in the background, and any problems are logged to a file
+  instead of vanishing.

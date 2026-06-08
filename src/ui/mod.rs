@@ -14,6 +14,7 @@ use ratatui::{
 use crate::app::{AppState, LiveStatus, Tab, TransitionKind};
 use crate::git::{WorktreeRecord, WorktreeStatus};
 use crate::process::ProcessInfo;
+use crate::storage::EventKind;
 
 /// Render the whole UI for the current frame.
 pub fn render(frame: &mut Frame, app: &AppState) {
@@ -71,6 +72,7 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
             "Cleanup",
             "safe cleanup candidates arrive in Phase 8.",
         ),
+        Tab::Timeline => render_timeline(frame, area, app),
         Tab::Help => render_placeholder(
             frame,
             area,
@@ -397,6 +399,52 @@ fn truncate_cmd(cmd: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+fn render_timeline(frame: &mut Frame, area: Rect, app: &AppState) {
+    if app.archive.is_empty() {
+        render_placeholder(
+            frame,
+            area,
+            "Timeline",
+            "no recorded events yet — created/removed worktrees will appear here.",
+        );
+        return;
+    }
+    let now = crate::storage::events::epoch_secs();
+    let items: Vec<ListItem> = app
+        .archive
+        .iter()
+        .take(300)
+        .map(|ev| {
+            let kind = match ev.kind {
+                EventKind::WorktreeCreated => Span::from("created").fg(Color::Cyan),
+                EventKind::WorktreeRemoved => Span::from("removed").fg(theme::COLLISION),
+            };
+            let name = ev.branch.clone().unwrap_or_else(|| ev.path.clone());
+            let mut spans = vec![
+                Span::from(format!("{:>5} ago  ", human_dur(ev.age_secs(now)))).fg(theme::DIM),
+                kind,
+                Span::from(format!("  {name}")).bold(),
+                Span::from(format!("   {}", ev.path)).fg(theme::DIM),
+            ];
+            if let Some(dirty) = ev.dirty
+                && !dirty.is_clean()
+            {
+                spans.push(
+                    Span::from(format!(
+                        "  ({} unstaged, {} staged)",
+                        dirty.unstaged, dirty.staged
+                    ))
+                    .fg(theme::DIRTY),
+                );
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(format!(" Timeline ({}) ", app.archive.len())));
+    frame.render_widget(list, area);
+}
+
 fn render_placeholder(frame: &mut Frame, area: Rect, title: &str, note: &str) {
     let body = Paragraph::new(format!("{title} — {note}"))
         .block(Block::bordered().title(format!(" {title} ")))
@@ -414,7 +462,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::from("move  ").fg(theme::DIM),
         Span::from("r ").bold(),
         Span::from("refresh  ").fg(theme::DIM),
-        Span::from("1-6 ").bold(),
+        Span::from("1-7 ").bold(),
         Span::from("jump  ").fg(theme::DIM),
         Span::from("? ").bold(),
         Span::from("help").fg(theme::DIM),
@@ -433,7 +481,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Shift+Tab  previous tab"),
         Line::from("  j / k      move selection down / up"),
         Line::from("  r          refresh the snapshot"),
-        Line::from("  1 – 6      jump to a tab"),
+        Line::from("  1 – 7      jump to a tab"),
         Line::from(""),
         Line::from("Live worktree intelligence arrives phase by phase.".fg(theme::DIM)),
     ];

@@ -62,3 +62,10 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 - Fixed: a failed capture no longer wedges the live engine (the in-flight guard always resets
   via an `Option` result channel); `r` now routes through the reducer (a pending-refresh flag)
   rather than being intercepted, keeping the reducer the single mutation point.
+- Event archive + Timeline: created/removed worktrees are detected on each snapshot diff,
+  flashed (Created/Deleted), and recorded to `<common_git_dir>/wb300/events.jsonl`; a new
+  **Timeline** tab (keys now 1–7) shows the history newest-first, surviving across sessions.
+- Bounded + safe (post-review): a single dedicated writer thread owns the file (ordered,
+  non-interleaved appends); the in-memory archive is a capped `VecDeque` (2000) and the on-disk
+  log is pruned by age (30 days) + count and compacted at startup. `tracing` diagnostics now go
+  to `<state_dir>/wb300.log`, so watcher/archive failures are no longer silent.
