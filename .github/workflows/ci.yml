@@ -1,0 +1,119 @@
+name: CI
+
+# Quality gate for every commit and PR. Complements the cargo-dist release.yml
+# workflow (which only runs on tag push to ship binaries) and crates-publish.yml
+# (which chains off a green CI run on main to publish to crates.io).
+#
+# Jobs:
+#   fmt        — cargo fmt --check (rustfmt is platform-agnostic, Linux only)
+#   clippy     — cargo clippy --all-targets -- -D warnings (Linux only)
+#   test       — cargo test --workspace (Linux glibc + macOS ARM + Windows)
+#   build      — cargo build --release smoke test (wb300 --version) on each OS
+#   audit      — cargo-audit (advisory; continue-on-error so it never blocks)
+#   dist-plan  — verify cargo-dist plan parses (catches dist config errors before tagging)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat warnings during compilation of THIS crate as errors. Dependencies are
+  # capped (--cap-lints allow) by cargo, so their warnings never fail the build.
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --workspace -- -D warnings
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: "Linux x86_64 glibc"
+          - os: macos-latest
+            name: "macOS ARM (Apple Silicon)"
+          - os: windows-latest
+            name: "Windows x86_64"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace --all-targets
+
+  build:
+    name: Release Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: "Linux x86_64 glibc"
+          - os: macos-latest
+            name: "macOS ARM (Apple Silicon)"
+          - os: windows-latest
+            name: "Windows x86_64"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --workspace
+      # wb300 is a TUI: it can't run headless in CI, so the smoke test is the
+      # non-interactive `--version` path (clap handles it before any terminal setup).
+      - name: Smoke test (--version)
+        shell: bash
+        run: |
+          BIN="./target/release/wb300"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="./target/release/wb300.exe"
+          "$BIN" --version
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - run: cargo audit
+
+  dist-plan:
+    name: cargo-dist plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-dist v0.31.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+      - name: Verify dist plan parses
+        run: ~/.cargo/bin/dist plan

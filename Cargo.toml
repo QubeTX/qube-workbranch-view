@@ -1,0 +1,81 @@
+[package]
+name = "wb300"
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 (the latest). Editions are per-crate language epochs, not version
+# or dependency constraints — they only need Rust >= 1.85. MSRV is pinned in
+# lockstep with rust-toolchain.toml; bump both together. 1.95 matches the rest
+# of the QubeTX line and satisfies ratatui 0.30 + edition 2024.
+rust-version = "1.95"
+authors = ["Emmett S <hey@emmetts.dev>"]
+description = "Live TUI control tower for Git worktrees used by parallel coding agents"
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/QubeTX/qube-workbranch-view"
+keywords = ["cli", "tui", "git", "worktree", "devtools"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/build.rs",
+    "/man/**",
+    "/src/**",
+    "/tests/**",
+    "/wix/**",
+    "/wix-corporate/**",
+]
+
+[package.metadata.wix]
+upgrade-guid = "8BA6E6D1-7F65-4CD1-B8C3-B4C03BFC6526"
+path-guid = "97091D9A-5D6E-4471-8C72-311B0999197F"
+license = false
+eula = false
+
+[[bin]]
+name = "wb300"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30.1"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal"] }
+futures-util = "0.3.32"
+clap = { version = "4.6.1", features = ["derive"] }
+color-eyre = "0.6.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[build-dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+clap_mangen = "0.2"
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# allow-dirty: "msi" lets wix/main.wxs carry the InstallSourceMarker component
+# that `wb300 update` uses to dispatch to the matching installer (Phase 9).
+# release.yml is kept as pure `dist generate --mode=ci` output (no hand edits),
+# so "ci" is intentionally absent.
+allow-dirty = ["msi"]
+# The installers to generate for each app
+installers = ["shell", "powershell", "msi"]
+# Target platforms to build apps for (Rust target-triple syntax) — identical to TR-300
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# Whether to install an updater program
+install-updater = false
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to publish prereleases to package managers
+publish-prereleases = false
