@@ -5,6 +5,7 @@
 //! is the Git source of truth; the rest of the app derives its view from it.
 
 pub mod commands;
+pub mod diff;
 pub mod refs;
 pub mod repo;
 pub mod snapshot;

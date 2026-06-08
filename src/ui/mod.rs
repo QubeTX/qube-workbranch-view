@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::app::{AppState, LiveStatus, Tab, TransitionKind};
+use crate::collision::Severity;
 use crate::git::{WorktreeRecord, WorktreeStatus};
 use crate::process::ProcessInfo;
 use crate::storage::EventKind;
@@ -60,12 +61,7 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
         Tab::Overview => render_overview(frame, area, app),
         Tab::Worktrees => render_worktrees(frame, area, app),
         Tab::Processes => render_processes(frame, area, app),
-        Tab::Collisions => render_placeholder(
-            frame,
-            area,
-            "Collisions",
-            "changed-file overlap detection arrives in Phase 6.",
-        ),
+        Tab::Collisions => render_collisions(frame, area, app),
         Tab::Cleanup => render_placeholder(
             frame,
             area,
@@ -107,6 +103,10 @@ fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
             Span::from(" active    ").fg(theme::DIM),
             Span::from(dirty.to_string()).bold().fg(theme::DIRTY),
             Span::from(" dirty    ").fg(theme::DIM),
+            Span::from(s.collisions.len().to_string())
+                .bold()
+                .fg(theme::COLLISION),
+            Span::from(" collisions    ").fg(theme::DIM),
             Span::from(s.local_branch_count().to_string()).bold(),
             Span::from(" local    ").fg(theme::DIM),
             Span::from(s.remote_branch_count().to_string()).bold(),
@@ -149,6 +149,7 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
                 Some(i) == current,
                 app.snapshot.processes.agent_for_worktree(i),
                 app.transition_for(&wt.path),
+                crate::collision::count_for_worktree(&app.snapshot.collisions, i),
             )
         })
         .collect();
@@ -170,6 +171,7 @@ fn worktree_item<'a>(
     is_current: bool,
     agent: Option<&ProcessInfo>,
     transition: Option<TransitionKind>,
+    collisions: usize,
 ) -> ListItem<'a> {
     let mut spans = Vec::new();
     if let Some(kind) = transition {
@@ -191,6 +193,9 @@ fn worktree_item<'a>(
     }
     if wt.prunable.is_some() {
         spans.push(Span::from(" prunable").fg(theme::DIM));
+    }
+    if collisions > 0 {
+        spans.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
     }
     spans.extend(status_badges(wt.status.as_ref()));
     ListItem::new(Line::from(spans))
@@ -443,6 +448,66 @@ fn render_timeline(frame: &mut Frame, area: Rect, app: &AppState) {
     let list = List::new(items)
         .block(Block::bordered().title(format!(" Timeline ({}) ", app.archive.len())));
     frame.render_widget(list, area);
+}
+
+fn render_collisions(frame: &mut Frame, area: Rect, app: &AppState) {
+    let collisions = &app.snapshot.collisions;
+    let no_base = app.snapshot.base.is_none();
+
+    if collisions.is_empty() {
+        let note = if no_base {
+            "no working-tree collisions. (No base branch like origin/main found, so \
+             committed-but-clean conflicts aren't detected.)"
+        } else {
+            "no changed-file collisions across worktrees — nobody's stepping on each other."
+        };
+        render_placeholder(frame, area, "Collisions", note);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut last_severity: Option<Severity> = None;
+    for collision in collisions {
+        if last_severity != Some(collision.severity) {
+            items.push(ListItem::new(Line::from(
+                Span::from(collision.severity.label())
+                    .bold()
+                    .fg(severity_color(collision.severity)),
+            )));
+            last_severity = Some(collision.severity);
+        }
+        let names: Vec<String> = collision
+            .worktrees
+            .iter()
+            .map(|&i| {
+                app.worktrees()
+                    .get(i)
+                    .map_or_else(|| format!("(worktree #{i})"), WorktreeRecord::display_name)
+            })
+            .collect();
+        items.push(ListItem::new(Line::from(vec![
+            Span::from(format!("  {}", collision.file)).bold(),
+            Span::from(format!("   {}", names.join(", "))).fg(theme::DIM),
+        ])));
+    }
+
+    let base_note = if no_base {
+        " · base: none — committed-conflict detection inactive"
+    } else {
+        ""
+    };
+    let list = List::new(items)
+        .block(Block::bordered().title(format!(" Collisions ({}){base_note} ", collisions.len())));
+    frame.render_widget(list, area);
+}
+
+fn severity_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Critical => Color::Red,
+        Severity::High => Color::LightRed,
+        Severity::Medium => Color::Yellow,
+        Severity::Low => theme::DIM,
+    }
 }
 
 fn render_placeholder(frame: &mut Frame, area: Rect, title: &str, note: &str) {

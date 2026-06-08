@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod collision;
 pub mod git;
 pub mod live;
 pub mod process;

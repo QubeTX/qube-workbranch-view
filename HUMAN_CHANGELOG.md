@@ -38,3 +38,9 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   new Timeline tab; that history survives restarts. It's kept tidy automatically (trimmed by
   age and size), written safely in the background, and any problems are logged to a file
   instead of vanishing.
+- WB-300 now warns you where agents are about to clash. It compares which files each worktree
+  has changed — including files already committed since the shared branch — and flags any file
+  two or more worktrees have touched, color-coded by how dangerous it is (lockfiles, database
+  migrations, and CI configs are the scariest). There's a new Collisions tab and a ⚠ marker
+  next to any worktree caught in one. It also does this work faster by checking worktrees in
+  parallel.

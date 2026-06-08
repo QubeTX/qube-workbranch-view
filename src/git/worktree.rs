@@ -21,6 +21,9 @@ pub struct WorktreeRecord {
     /// Working-tree status — `None` until filled by snapshot capture (the
     /// porcelain parser leaves it unset).
     pub status: Option<WorktreeStatus>,
+    /// Files this worktree has touched (working-tree changes + committed since
+    /// base) — filled by snapshot capture; drives collision detection.
+    pub touched: Vec<String>,
 }
 
 impl WorktreeRecord {

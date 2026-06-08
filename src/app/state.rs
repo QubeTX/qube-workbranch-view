@@ -332,6 +332,8 @@ mod tests {
             },
             worktrees,
             branches: Vec::new(),
+            base: None,
+            collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
         }
     }
@@ -428,6 +430,8 @@ mod tests {
             },
             worktrees,
             branches: Vec::new(),
+            base: None,
+            collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
         }
     }

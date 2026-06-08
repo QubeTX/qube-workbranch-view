@@ -69,3 +69,12 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   non-interleaved appends); the in-memory archive is a capped `VecDeque` (2000) and the on-disk
   log is pruned by age (30 days) + count and compacted at startup. `tracing` diagnostics now go
   to `<state_dir>/wb300.log`, so watcher/archive failures are no longer silent.
+- Collision detection: per-worktree "touched files" (unstaged + staged + committed-since-base
+  via `<base>...HEAD`) are inverted to find files touched by ≥2 worktrees, ranked by built-in
+  hot-path severity (Critical: lockfiles / migrations / schema / CI → High: manifests / db /
+  auth → Medium: source → Low: docs / tests). New **Collisions** tab grouped by severity, a
+  `⚠ N` worktree badge, and an Overview count. Capture detects a base ref (origin/main →
+  origin/master → main → master) and surfaces when none is found (committed-conflict detection
+  inactive). Per-worktree git work now runs with bounded concurrency (4).
+- Review fixes: `schema.prisma` over-match tightened to `/schema.prisma`; defensive
+  worktree-name fallback in collision rows.

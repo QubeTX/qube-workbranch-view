@@ -104,3 +104,59 @@ async fn discovers_linked_worktree() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&linked);
 }
+
+fn sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let name = format!("{}-{suffix}", dir.file_name().unwrap().to_string_lossy());
+    let mut path = dir.to_path_buf();
+    path.set_file_name(name);
+    path
+}
+
+#[tokio::test]
+async fn detects_collision_across_worktrees() {
+    let dir = temp_dir("collide");
+    init_repo(&dir);
+
+    let wt_a = sibling(&dir, "a");
+    let wt_b = sibling(&dir, "b");
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/a",
+            wt_a.to_str().unwrap(),
+        ],
+    );
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/b",
+            wt_b.to_str().unwrap(),
+        ],
+    );
+
+    // Both feature worktrees modify the same tracked file.
+    std::fs::write(wt_a.join("README.md"), "change from a\n").unwrap();
+    std::fs::write(wt_b.join("README.md"), "change from b\n").unwrap();
+
+    let repo = RepoIdentity::discover(&dir).await.expect("discover");
+    let snap = RepoSnapshot::capture(repo).await.expect("capture");
+
+    let collision = snap
+        .collisions
+        .iter()
+        .find(|c| c.file == "README.md")
+        .expect("README.md should collide across feat/a and feat/b");
+    assert!(collision.worktrees.len() >= 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&wt_a);
+    let _ = std::fs::remove_dir_all(&wt_b);
+}
