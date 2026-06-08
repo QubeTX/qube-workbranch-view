@@ -20,6 +20,10 @@ pub enum Action {
     PrevTab,
     /// Jump directly to a tab.
     SelectTab(Tab),
+    /// Move the selection down within the current list.
+    MoveDown,
+    /// Move the selection up within the current list.
+    MoveUp,
     /// Toggle the help overlay.
     ToggleHelp,
 }

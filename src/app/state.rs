@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::action::Action;
+use crate::git::{RepoSnapshot, WorktreeRecord};
 
 /// Top-level views. Mirrors the design's tab set; Timeline arrives with the
 /// event archive in a later phase (handoff §14.2).
@@ -55,8 +56,8 @@ impl Tab {
     }
 }
 
-/// The whole UI state. `RepoSnapshot` (the Git source of truth) is layered in
-/// from Phase 1 onward; for now this carries just enough to render the shell.
+/// The whole UI state. `snapshot` is the Git source of truth; everything the UI
+/// shows is derived from it. Live refresh swaps the snapshot in later phases.
 #[derive(Debug)]
 pub struct AppState {
     /// Set once the user has asked to quit; the event loop checks it each turn.
@@ -65,19 +66,38 @@ pub struct AppState {
     pub active_tab: Tab,
     /// Whether the help overlay is shown.
     pub show_help: bool,
-    /// Human-readable label for the repository under inspection.
-    pub repo_label: String,
+    /// The captured Git state.
+    pub snapshot: RepoSnapshot,
+    /// Selected index within the worktree list.
+    pub selected: usize,
 }
 
 impl AppState {
-    /// Create the initial state for a repository.
-    pub fn new(repo_label: String) -> Self {
+    /// Create the initial state from a captured snapshot.
+    pub fn new(snapshot: RepoSnapshot) -> Self {
+        let selected = snapshot.current_worktree_index().unwrap_or(0);
         Self {
             should_quit: false,
             active_tab: Tab::Overview,
             show_help: false,
-            repo_label,
+            snapshot,
+            selected,
         }
+    }
+
+    /// The worktrees from the current snapshot.
+    pub fn worktrees(&self) -> &[WorktreeRecord] {
+        &self.snapshot.worktrees
+    }
+
+    /// The currently selected worktree, if any.
+    pub fn selected_worktree(&self) -> Option<&WorktreeRecord> {
+        self.worktrees().get(self.selected)
+    }
+
+    /// Human-readable label for the repository under inspection.
+    pub fn repo_label(&self) -> String {
+        self.snapshot.repo.root.display().to_string()
     }
 
     /// Resolve a key press to an [`Action`] given the current context.
@@ -92,6 +112,8 @@ impl AppState {
             KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Tab => Action::NextTab,
             KeyCode::BackTab => Action::PrevTab,
+            KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
+            KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
             KeyCode::Char(c @ '1'..='6') => {
                 let idx = (c as u8 - b'1') as usize;
                 Action::SelectTab(Tab::ALL[idx])
@@ -108,6 +130,13 @@ impl AppState {
             Action::NextTab => self.active_tab = self.active_tab.next(),
             Action::PrevTab => self.active_tab = self.active_tab.prev(),
             Action::SelectTab(tab) => self.active_tab = tab,
+            Action::MoveDown => {
+                let len = self.worktrees().len();
+                if len > 0 {
+                    self.selected = (self.selected + 1).min(len - 1);
+                }
+            }
+            Action::MoveUp => self.selected = self.selected.saturating_sub(1),
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {
@@ -121,7 +150,32 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{RepoIdentity, WorktreeRecord};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn snapshot_with(n: usize) -> RepoSnapshot {
+        let worktrees = (0..n)
+            .map(|i| WorktreeRecord {
+                path: format!("/repo-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        RepoSnapshot {
+            repo: RepoIdentity {
+                start_dir: "/repo".into(),
+                root: "/repo".into(),
+                git_dir: "/repo/.git".into(),
+                common_git_dir: "/repo/.git".into(),
+                is_worktree: false,
+            },
+            worktrees,
+            branches: Vec::new(),
+        }
+    }
+
+    fn app(n: usize) -> AppState {
+        AppState::new(snapshot_with(n))
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -129,49 +183,67 @@ mod tests {
 
     #[test]
     fn q_quits() {
-        let mut app = AppState::new("repo".into());
-        let action = app.resolve_key(key(KeyCode::Char('q')));
+        let mut a = app(0);
+        let action = a.resolve_key(key(KeyCode::Char('q')));
         assert_eq!(action, Action::Quit);
-        app.apply(action);
-        assert!(app.should_quit);
+        a.apply(action);
+        assert!(a.should_quit);
     }
 
     #[test]
     fn tab_cycles_forward_and_wraps() {
-        let mut app = AppState::new("repo".into());
-        assert_eq!(app.active_tab, Tab::Overview);
+        let mut a = app(0);
+        assert_eq!(a.active_tab, Tab::Overview);
         for _ in 0..Tab::ALL.len() {
-            let a = app.resolve_key(key(KeyCode::Tab));
-            app.apply(a);
+            let action = a.resolve_key(key(KeyCode::Tab));
+            a.apply(action);
         }
-        assert_eq!(app.active_tab, Tab::Overview); // wrapped fully around
+        assert_eq!(a.active_tab, Tab::Overview); // wrapped fully around
     }
 
     #[test]
     fn back_tab_goes_to_last() {
-        let mut app = AppState::new("repo".into());
-        let a = app.resolve_key(key(KeyCode::BackTab));
-        app.apply(a);
-        assert_eq!(app.active_tab, Tab::Help);
+        let mut a = app(0);
+        let action = a.resolve_key(key(KeyCode::BackTab));
+        a.apply(action);
+        assert_eq!(a.active_tab, Tab::Help);
     }
 
     #[test]
     fn number_selects_tab() {
-        let mut app = AppState::new("repo".into());
-        let a = app.resolve_key(key(KeyCode::Char('3')));
-        app.apply(a);
-        assert_eq!(app.active_tab, Tab::Processes);
+        let mut a = app(0);
+        let action = a.resolve_key(key(KeyCode::Char('3')));
+        a.apply(action);
+        assert_eq!(a.active_tab, Tab::Processes);
     }
 
     #[test]
     fn help_toggles() {
-        let mut app = AppState::new("repo".into());
-        let a = app.resolve_key(key(KeyCode::Char('?')));
-        app.apply(a);
-        assert!(app.show_help);
-        let a = app.resolve_key(key(KeyCode::Esc));
-        app.apply(a);
-        assert!(!app.show_help);
-        assert!(!app.should_quit);
+        let mut a = app(0);
+        a.apply(a.resolve_key(key(KeyCode::Char('?'))));
+        assert!(a.show_help);
+        a.apply(a.resolve_key(key(KeyCode::Esc)));
+        assert!(!a.show_help);
+        assert!(!a.should_quit);
+    }
+
+    #[test]
+    fn worktree_navigation_clamps() {
+        let mut a = app(3);
+        assert_eq!(a.selected, 0);
+        a.apply(Action::MoveUp); // already at top
+        assert_eq!(a.selected, 0);
+        a.apply(Action::MoveDown);
+        a.apply(Action::MoveDown);
+        assert_eq!(a.selected, 2);
+        a.apply(Action::MoveDown); // clamp at bottom
+        assert_eq!(a.selected, 2);
+    }
+
+    #[test]
+    fn navigation_noop_when_empty() {
+        let mut a = app(0);
+        a.apply(Action::MoveDown);
+        assert_eq!(a.selected, 0);
     }
 }

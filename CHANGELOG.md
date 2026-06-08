@@ -22,3 +22,12 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 - PolyForm Noncommercial 1.0.0 `LICENSE`, MSRV pin (1.95) in lockstep with
   `rust-toolchain.toml`, `clap_mangen` man-page generation via `build.rs`, and project docs
   (`CLAUDE.md`, `AGENTS.md`, `docs/`).
+- Git layer: `RepoIdentity::discover` (repo root + git/common dir via `rev-parse
+  --path-format=absolute`) and an async, timeout-guarded `git` CLI wrapper that suppresses
+  interactive prompts (`GIT_TERMINAL_PROMPT=0`).
+- Fixture-tested NUL-safe parsers for `git worktree list --porcelain -z` and
+  `git for-each-ref`, captured into a `RepoSnapshot` (worktrees + local/remote refs).
+- Worktrees tab renders the live worktree list — current-worktree marker plus
+  detached/locked/prunable flags — with `j`/`k` navigation; Overview shows worktree and
+  local/remote branch counts. Launching outside a repo prints a friendly message and exits
+  non-zero (the machine-wide view for non-repo directories is deferred to a later phase).
