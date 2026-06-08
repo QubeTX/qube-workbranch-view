@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
 };
 
-use crate::app::{AppState, Tab, TransitionKind};
+use crate::app::{AppState, LiveStatus, Tab, TransitionKind};
 use crate::git::{WorktreeRecord, WorktreeStatus};
 use crate::process::ProcessInfo;
 
@@ -37,12 +37,21 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     let title = Line::from(vec![
         Span::from(" WB-300 ").bold().fg(theme::ACCENT),
         Span::from(format!("· {} ", app.repo_label())).fg(theme::DIM),
+        live_indicator(app.live),
     ]);
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| Line::from(t.title())))
         .block(Block::bordered().title(title))
         .select(app.active_tab.index())
         .highlight_style(Style::new().bold().fg(theme::ACCENT));
     frame.render_widget(tabs, area);
+}
+
+fn live_indicator(status: LiveStatus) -> Span<'static> {
+    match status {
+        LiveStatus::Live => Span::from("● live ").fg(theme::CLEAN),
+        LiveStatus::PollOnly => Span::from("◐ poll-only ").fg(Color::Yellow),
+        LiveStatus::Static => Span::from("○ static ").fg(theme::DIM),
+    }
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {

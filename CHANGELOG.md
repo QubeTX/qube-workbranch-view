@@ -55,3 +55,10 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   on Git.
 - Transient highlights (4s TTL): worktrees flash Created / Modified when a snapshot diff
   detects a change. `--no-live` disables the watcher + poll (manual `r` still refreshes).
+- Watcher hardening (post-review): watches the *pruned* source tree (skips
+  `.git`/`node_modules`/`target`/…), non-recursive per directory, **capped at 2048 watches** —
+  bounded on every OS so it never exhausts the shared Linux `inotify` budget. A header
+  indicator shows `live` / `poll-only` / `static`.
+- Fixed: a failed capture no longer wedges the live engine (the in-flight guard always resets
+  via an `Option` result channel); `r` now routes through the reducer (a pending-refresh flag)
+  rather than being intercepted, keeping the reducer the single mutation point.

@@ -28,3 +28,8 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   no need to press refresh — and the worktree briefly flashes to show it just changed. It also
   re-checks periodically as a safety net, and all of this runs in the background so the
   dashboard never freezes while Git is working. (Live watching can be turned off with a flag.)
+- Made the live file-watching a good citizen of your system: it only watches your source files
+  (not big folders like node_modules or build output) and caps how much it watches, so it
+  won't interfere with other apps' file watching. The header shows whether you're in live,
+  periodic-only, or static mode, and a hiccup while reading Git can no longer freeze the
+  live updates.

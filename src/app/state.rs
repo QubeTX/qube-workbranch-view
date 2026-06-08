@@ -59,8 +59,19 @@ impl Tab {
     }
 }
 
+/// Whether live updating is active (drives the header indicator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveStatus {
+    /// Filesystem watcher active, plus the poll backstop.
+    Live,
+    /// Watcher unavailable; periodic poll only.
+    PollOnly,
+    /// `--no-live`: no watcher and no poll (manual refresh only).
+    Static,
+}
+
 /// The whole UI state. `snapshot` is the Git source of truth; everything the UI
-/// shows is derived from it. Live refresh swaps the snapshot in later phases.
+/// shows is derived from it.
 #[derive(Debug)]
 pub struct AppState {
     /// Set once the user has asked to quit; the event loop checks it each turn.
@@ -75,6 +86,10 @@ pub struct AppState {
     pub selected: usize,
     /// Transient highlights for live changes.
     pub transitions: Transitions,
+    /// Set by `apply(Refresh)`; consumed by the event loop to trigger a capture.
+    pending_refresh: bool,
+    /// Whether live updating is active (for the header indicator).
+    pub live: LiveStatus,
 }
 
 impl AppState {
@@ -88,6 +103,8 @@ impl AppState {
             snapshot,
             selected,
             transitions: Transitions::default(),
+            pending_refresh: false,
+            live: LiveStatus::Static,
         }
     }
 
@@ -138,6 +155,16 @@ impl AppState {
     /// Drop expired transient highlights (driven by the animation tick).
     pub fn expire_transitions(&mut self) {
         self.transitions.expire();
+    }
+
+    /// Consume the pending-refresh flag set by `apply(Action::Refresh)`.
+    pub fn take_pending_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.pending_refresh)
+    }
+
+    /// Record whether live updating is active (set once by the event loop).
+    pub fn set_live_status(&mut self, status: LiveStatus) {
+        self.live = status;
     }
 
     /// The worktrees from the current snapshot.
@@ -193,9 +220,9 @@ impl AppState {
                 }
             }
             Action::MoveUp => self.selected = self.selected.saturating_sub(1),
-            // The async re-capture is performed by the event loop; there is
-            // nothing to mutate synchronously here.
-            Action::Refresh => {}
+            // The async re-capture runs in the event loop; the reducer just
+            // records the intent (keeping mutation in one place).
+            Action::Refresh => self.pending_refresh = true,
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {

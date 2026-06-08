@@ -16,7 +16,7 @@ pub mod util;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use app::{Action, AppState};
+use app::{AppState, LiveStatus};
 use cli::{Cli, Command};
 use color_eyre::eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -81,17 +81,26 @@ async fn run_loop(
     let repo = snapshot.repo.clone();
     let mut app = AppState::new(snapshot);
 
-    let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<git::RepoSnapshot>(8);
+    // The capture channel carries Option: None means a capture failed, so the
+    // loop still resets `in_flight` and never wedges the live engine.
+    let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<Option<git::RepoSnapshot>>(8);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
 
     // Filesystem watcher → debouncer → refresh requests. The watcher is held for
     // its lifetime; if it can't start, the periodic poll still keeps us current.
+    let mut live_status = if no_live {
+        LiveStatus::Static
+    } else {
+        LiveStatus::PollOnly
+    };
     let mut _watcher = None;
     if !no_live {
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         match live::fs_watcher::watch(&watch_paths(&app.snapshot), raw_tx) {
-            Ok(watcher) => {
+            Ok((watcher, watched)) => {
                 _watcher = Some(watcher);
+                live_status = LiveStatus::Live;
+                tracing::info!("watching {watched} directories");
                 tokio::spawn(live::debouncer::run(
                     raw_rx,
                     refresh_tx.clone(),
@@ -101,6 +110,7 @@ async fn run_loop(
             Err(err) => tracing::warn!("filesystem watcher unavailable: {err}"),
         }
     }
+    app.set_live_status(live_status);
 
     let mut poll = tokio::time::interval(Duration::from_millis(1500));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -120,11 +130,7 @@ async fn run_loop(
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     let action = app.resolve_key(key);
-                    if action == Action::Refresh {
-                        want_refresh = true;
-                    } else {
-                        app.apply(action);
-                    }
+                    app.apply(action);
                 }
                 Some(Ok(_)) => {}
                 Some(Err(err)) => return Err(err.into()),
@@ -133,10 +139,17 @@ async fn run_loop(
             Some(()) = refresh_rx.recv() => want_refresh = true,
             _ = poll.tick(), if !no_live => want_refresh = true,
             _ = anim.tick() => app.expire_transitions(),
-            Some(snapshot) = snap_rx.recv() => {
+            Some(result) = snap_rx.recv() => {
                 in_flight = false;
-                app.ingest_snapshot(snapshot);
+                if let Some(snapshot) = result {
+                    app.ingest_snapshot(snapshot);
+                }
             }
+        }
+
+        // `r` flows through the reducer (apply → pending flag); consume it here.
+        if app.take_pending_refresh() {
+            want_refresh = true;
         }
 
         // Coalesce concurrent triggers: one capture at a time, off the UI task.
@@ -145,9 +158,8 @@ async fn run_loop(
             let tx = snap_tx.clone();
             let repo = repo.clone();
             tokio::spawn(async move {
-                if let Ok(snapshot) = git::RepoSnapshot::capture(repo).await {
-                    let _ = tx.send(snapshot).await;
-                }
+                let result = git::RepoSnapshot::capture(repo).await.ok();
+                let _ = tx.send(result).await;
             });
         }
     }
