@@ -48,3 +48,10 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   an active-worktree count. The scan runs off the async executor (`spawn_blocking`).
 - Unit tests for classification and prefix matching (`src/util/paths.rs`,
   `src/process/classifier.rs`).
+- Live local engine: a `notify` filesystem watcher (ignoring `.git/objects` + heavy build
+  dirs) feeds a debouncer that coalesces bursts into a single refresh. The event loop is now a
+  `tokio::select!` over terminal input, debounced refreshes, a periodic poll backstop (1.5s),
+  an animation tick, and completed captures — which run on spawned tasks so the UI never blocks
+  on Git.
+- Transient highlights (4s TTL): worktrees flash Created / Modified when a snapshot diff
+  detects a change. `--no-live` disables the watcher + poll (manual `r` still refreshes).

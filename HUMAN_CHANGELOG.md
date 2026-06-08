@@ -24,3 +24,7 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   editors). The Processes tab lists them with CPU, memory, and how long they've been running;
   each worktree shows a green "● claude pid 1234" marker when an agent is live there; and the
   overview counts how many worktrees are actively being worked on.
+- WB-300 now updates itself live. Save a file in a worktree and its status updates on its own —
+  no need to press refresh — and the worktree briefly flashes to show it just changed. It also
+  re-checks periodically as a safety net, and all of this runs in the background so the
+  dashboard never freezes while Git is working. (Live watching can be turned off with a flag.)

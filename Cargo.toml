@@ -47,6 +47,7 @@ color-eyre = "0.6.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 sysinfo = "0.39.3"
+notify = "8.2.0"
 
 [build-dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

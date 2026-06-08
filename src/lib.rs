@@ -7,10 +7,14 @@
 pub mod app;
 pub mod cli;
 pub mod git;
+pub mod live;
 pub mod process;
 pub mod terminal;
 pub mod ui;
 pub mod util;
+
+use std::path::PathBuf;
+use std::time::Duration;
 
 use app::{Action, AppState};
 use cli::{Cli, Command};
@@ -60,42 +64,106 @@ pub async fn run(cli: Cli) -> Result<()> {
         mouse: false,
     };
     let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
-    let result = run_loop(&mut terminal, snapshot).await;
+    let result = run_loop(&mut terminal, snapshot, cli.no_live).await;
     guard.restore();
     result
 }
 
-/// The render/input loop. Pure event-driven for now; the live engine will add
-/// ticks via a `tokio::select!` here in Phase 4.
-async fn run_loop(terminal: &mut terminal::Tui, snapshot: git::RepoSnapshot) -> Result<()> {
+/// The render/input loop: a `tokio::select!` over terminal input, debounced
+/// filesystem refreshes, a periodic poll backstop, an animation tick, and
+/// completed snapshot captures. Captures run on spawned tasks so the UI never
+/// blocks on Git (handoff §8).
+async fn run_loop(
+    terminal: &mut terminal::Tui,
+    snapshot: git::RepoSnapshot,
+    no_live: bool,
+) -> Result<()> {
+    let repo = snapshot.repo.clone();
     let mut app = AppState::new(snapshot);
-    let mut events = EventStream::new();
 
-    while !app.should_quit {
-        terminal.draw(|frame| ui::render(frame, &app))?;
+    let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<git::RepoSnapshot>(8);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
 
-        match events.next().await {
-            // Filter to key *presses*: Windows terminals also emit Release/Repeat.
-            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                let action = app.resolve_key(key);
-                if action == Action::Refresh {
-                    // Re-capture off the reducer (it can't await). This briefly
-                    // blocks input; Phase 4 will spawn it instead.
-                    if let Ok(snapshot) =
-                        git::RepoSnapshot::capture(app.snapshot.repo.clone()).await
-                    {
-                        app.set_snapshot(snapshot);
-                    }
-                } else {
-                    app.apply(action);
-                }
+    // Filesystem watcher → debouncer → refresh requests. The watcher is held for
+    // its lifetime; if it can't start, the periodic poll still keeps us current.
+    let mut _watcher = None;
+    if !no_live {
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        match live::fs_watcher::watch(&watch_paths(&app.snapshot), raw_tx) {
+            Ok(watcher) => {
+                _watcher = Some(watcher);
+                tokio::spawn(live::debouncer::run(
+                    raw_rx,
+                    refresh_tx.clone(),
+                    Duration::from_millis(300),
+                ));
             }
-            // Resize / mouse / paste — the next loop iteration redraws.
-            Some(Ok(_)) => {}
-            Some(Err(err)) => return Err(err.into()),
-            // Event stream closed (e.g. stdin EOF): exit cleanly.
-            None => break,
+            Err(err) => tracing::warn!("filesystem watcher unavailable: {err}"),
+        }
+    }
+
+    let mut poll = tokio::time::interval(Duration::from_millis(1500));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut anim = tokio::time::interval(Duration::from_millis(250));
+    let mut events = EventStream::new();
+    let mut in_flight = false;
+
+    loop {
+        terminal.draw(|frame| ui::render(frame, &app))?;
+        if app.should_quit {
+            break;
+        }
+
+        let mut want_refresh = false;
+        tokio::select! {
+            // Filter to key *presses*: Windows terminals also emit Release/Repeat.
+            event = events.next() => match event {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    let action = app.resolve_key(key);
+                    if action == Action::Refresh {
+                        want_refresh = true;
+                    } else {
+                        app.apply(action);
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(err.into()),
+                None => break,
+            },
+            Some(()) = refresh_rx.recv() => want_refresh = true,
+            _ = poll.tick(), if !no_live => want_refresh = true,
+            _ = anim.tick() => app.expire_transitions(),
+            Some(snapshot) = snap_rx.recv() => {
+                in_flight = false;
+                app.ingest_snapshot(snapshot);
+            }
+        }
+
+        // Coalesce concurrent triggers: one capture at a time, off the UI task.
+        if want_refresh && !in_flight {
+            in_flight = true;
+            let tx = snap_tx.clone();
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                if let Ok(snapshot) = git::RepoSnapshot::capture(repo).await {
+                    let _ = tx.send(snapshot).await;
+                }
+            });
         }
     }
     Ok(())
+}
+
+/// Paths the filesystem watcher should watch: the repo root and every linked
+/// worktree root (the common git dir lives under the main root, so it's covered).
+fn watch_paths(snapshot: &git::RepoSnapshot) -> Vec<PathBuf> {
+    let mut paths = vec![snapshot.repo.root.clone()];
+    for wt in &snapshot.worktrees {
+        if !wt.bare {
+            paths.push(PathBuf::from(&wt.path));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }

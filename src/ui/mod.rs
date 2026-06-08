@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
 };
 
-use crate::app::{AppState, Tab};
+use crate::app::{AppState, Tab, TransitionKind};
 use crate::git::{WorktreeRecord, WorktreeStatus};
 use crate::process::ProcessInfo;
 
@@ -137,6 +137,7 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
                 wt,
                 Some(i) == current,
                 app.snapshot.processes.agent_for_worktree(i),
+                app.transition_for(&wt.path),
             )
         })
         .collect();
@@ -157,8 +158,13 @@ fn worktree_item<'a>(
     wt: &'a WorktreeRecord,
     is_current: bool,
     agent: Option<&ProcessInfo>,
+    transition: Option<TransitionKind>,
 ) -> ListItem<'a> {
-    let mut spans = vec![Span::from(wt.display_name()).bold()];
+    let mut spans = Vec::new();
+    if let Some(kind) = transition {
+        spans.push(transition_marker(kind));
+    }
+    spans.push(Span::from(wt.display_name()).bold());
     if is_current {
         spans.push(Span::from(" (current)").fg(theme::ACCENT));
     }
@@ -177,6 +183,16 @@ fn worktree_item<'a>(
     }
     spans.extend(status_badges(wt.status.as_ref()));
     ListItem::new(Line::from(spans))
+}
+
+/// A short-lived "flash" glyph for a just-changed worktree.
+fn transition_marker(kind: TransitionKind) -> Span<'static> {
+    match kind {
+        TransitionKind::Created => Span::from("✚ ").fg(Color::Cyan),
+        TransitionKind::Modified => Span::from("✎ ").fg(theme::DIRTY),
+        TransitionKind::Pushed => Span::from("↑ ").fg(theme::CLEAN),
+        TransitionKind::Deleted => Span::from("⌫ ").fg(theme::COLLISION),
+    }
 }
 
 /// Compact dirty/divergence badges for the worktree list.

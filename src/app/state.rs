@@ -1,8 +1,11 @@
 //! The application state and its reducer.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::action::Action;
+use super::transitions::{TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 
 /// Top-level views. Mirrors the design's tab set; Timeline arrives with the
@@ -70,6 +73,8 @@ pub struct AppState {
     pub snapshot: RepoSnapshot,
     /// Selected index within the worktree list.
     pub selected: usize,
+    /// Transient highlights for live changes.
+    pub transitions: Transitions,
 }
 
 impl AppState {
@@ -82,6 +87,7 @@ impl AppState {
             show_help: false,
             snapshot,
             selected,
+            transitions: Transitions::default(),
         }
     }
 
@@ -94,6 +100,44 @@ impl AppState {
         } else if self.selected >= len {
             self.selected = len - 1;
         }
+    }
+
+    /// Diff the new snapshot against the current one to raise transient
+    /// highlights, then swap it in. Used by both manual refresh and the live engine.
+    pub fn ingest_snapshot(&mut self, new: RepoSnapshot) {
+        let notes = {
+            let previous: HashMap<&str, &WorktreeRecord> = self
+                .snapshot
+                .worktrees
+                .iter()
+                .map(|wt| (wt.path.as_str(), wt))
+                .collect();
+            let mut notes: Vec<(String, TransitionKind)> = Vec::new();
+            for wt in &new.worktrees {
+                match previous.get(wt.path.as_str()) {
+                    None => notes.push((wt.path.clone(), TransitionKind::Created)),
+                    Some(old) if dirty_summary(old) != dirty_summary(wt) => {
+                        notes.push((wt.path.clone(), TransitionKind::Modified));
+                    }
+                    Some(_) => {}
+                }
+            }
+            notes
+        };
+        for (path, kind) in notes {
+            self.transitions.note(path, kind);
+        }
+        self.set_snapshot(new);
+    }
+
+    /// The active transient highlight for a worktree path, if any.
+    pub fn transition_for(&self, path: &str) -> Option<TransitionKind> {
+        self.transitions.get(path)
+    }
+
+    /// Drop expired transient highlights (driven by the animation tick).
+    pub fn expire_transitions(&mut self) {
+        self.transitions.expire();
     }
 
     /// The worktrees from the current snapshot.
@@ -159,6 +203,22 @@ impl AppState {
                 }
             }
         }
+    }
+}
+
+/// The persistent dirty/divergence fingerprint used to detect changes between
+/// snapshots. A `None` status compares as all-zero.
+fn dirty_summary(wt: &WorktreeRecord) -> (usize, usize, usize, usize, u32, u32) {
+    match &wt.status {
+        Some(s) => (
+            s.staged,
+            s.unstaged,
+            s.untracked,
+            s.conflicted,
+            s.ahead.unwrap_or(0),
+            s.behind.unwrap_or(0),
+        ),
+        None => (0, 0, 0, 0, 0, 0),
     }
 }
 
