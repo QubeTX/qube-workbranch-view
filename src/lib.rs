@@ -10,7 +10,7 @@ pub mod git;
 pub mod terminal;
 pub mod ui;
 
-use app::AppState;
+use app::{Action, AppState};
 use cli::{Cli, Command};
 use color_eyre::eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -76,7 +76,17 @@ async fn run_loop(terminal: &mut terminal::Tui, snapshot: git::RepoSnapshot) -> 
             // Filter to key *presses*: Windows terminals also emit Release/Repeat.
             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                 let action = app.resolve_key(key);
-                app.apply(action);
+                if action == Action::Refresh {
+                    // Re-capture off the reducer (it can't await). This briefly
+                    // blocks input; Phase 4 will spawn it instead.
+                    if let Ok(snapshot) =
+                        git::RepoSnapshot::capture(app.snapshot.repo.clone()).await
+                    {
+                        app.set_snapshot(snapshot);
+                    }
+                } else {
+                    app.apply(action);
+                }
             }
             // Resize / mouse / paste — the next loop iteration redraws.
             Some(Ok(_)) => {}

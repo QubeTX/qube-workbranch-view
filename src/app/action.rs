@@ -24,6 +24,8 @@ pub enum Action {
     MoveDown,
     /// Move the selection up within the current list.
     MoveUp,
+    /// Re-capture the repository snapshot.
+    Refresh,
     /// Toggle the help overlay.
     ToggleHelp,
 }

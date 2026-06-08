@@ -31,3 +31,11 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   detached/locked/prunable flags — with `j`/`k` navigation; Overview shows worktree and
   local/remote branch counts. Launching outside a repo prints a friendly message and exits
   non-zero (the machine-wide view for non-repo directories is deferred to a later phase).
+- Per-worktree status via `git status --porcelain=v2 --branch -z` (fixture-tested parser that
+  handles rename records, conflicts, and the upstream-gone case): staged/unstaged/untracked/
+  conflicted counts, ahead/behind, upstream, and upstream-gone.
+- Worktrees tab now shows status badges (dirty counts, ↑/↓ divergence, upstream-gone) and a
+  details pane for the selected worktree; Overview shows a dirty-worktree count. `r` refreshes
+  the snapshot.
+- Integration tests against real temporary repositories (dirty status + linked-worktree
+  discovery), guarding the parsers against real-world format drift.

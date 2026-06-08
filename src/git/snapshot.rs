@@ -5,6 +5,7 @@ use color_eyre::eyre::Result;
 use super::commands::git_stdout;
 use super::refs::{BranchInfo, FOR_EACH_REF_FORMAT, parse_refs};
 use super::repo::RepoIdentity;
+use super::status::parse_status_v2;
 use super::worktree::{WorktreeRecord, parse_worktrees};
 
 /// A point-in-time view of the repository: its worktrees and refs.
@@ -21,7 +22,21 @@ impl RepoSnapshot {
         let root = repo.root.clone();
 
         let wt_bytes = git_stdout(Some(&root), &["worktree", "list", "--porcelain", "-z"]).await?;
-        let worktrees = parse_worktrees(&wt_bytes);
+        let mut worktrees = parse_worktrees(&wt_bytes);
+
+        // Fill per-worktree status. Sequential is fine for a manual capture; the
+        // live engine (Phase 4) moves this off the UI loop and bounds concurrency.
+        for wt in worktrees.iter_mut() {
+            if wt.bare {
+                continue;
+            }
+            let path = std::path::Path::new(&wt.path);
+            if let Ok(bytes) =
+                git_stdout(Some(path), &["status", "--porcelain=v2", "--branch", "-z"]).await
+            {
+                wt.status = Some(parse_status_v2(&bytes));
+            }
+        }
 
         let fmt = format!("--format={FOR_EACH_REF_FORMAT}");
         let ref_bytes = git_stdout(

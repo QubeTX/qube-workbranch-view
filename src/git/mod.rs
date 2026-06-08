@@ -8,9 +8,11 @@ pub mod commands;
 pub mod refs;
 pub mod repo;
 pub mod snapshot;
+pub mod status;
 pub mod worktree;
 
 pub use refs::BranchInfo;
 pub use repo::RepoIdentity;
 pub use snapshot::RepoSnapshot;
+pub use status::WorktreeStatus;
 pub use worktree::WorktreeRecord;

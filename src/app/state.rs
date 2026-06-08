@@ -85,6 +85,17 @@ impl AppState {
         }
     }
 
+    /// Replace the snapshot (after a manual/live refresh), clamping selection.
+    pub fn set_snapshot(&mut self, snapshot: RepoSnapshot) {
+        self.snapshot = snapshot;
+        let len = self.snapshot.worktrees.len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+
     /// The worktrees from the current snapshot.
     pub fn worktrees(&self) -> &[WorktreeRecord] {
         &self.snapshot.worktrees
@@ -112,6 +123,7 @@ impl AppState {
             KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Tab => Action::NextTab,
             KeyCode::BackTab => Action::PrevTab,
+            KeyCode::Char('r') => Action::Refresh,
             KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
             KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
             KeyCode::Char(c @ '1'..='6') => {
@@ -137,6 +149,9 @@ impl AppState {
                 }
             }
             Action::MoveUp => self.selected = self.selected.saturating_sub(1),
+            // The async re-capture is performed by the event loop; there is
+            // nothing to mutate synchronously here.
+            Action::Refresh => {}
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {

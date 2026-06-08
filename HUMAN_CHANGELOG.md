@@ -16,3 +16,6 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   you're in and flagging detached, locked, or leftover ones), and counts your local and remote
   branches — shown live in the dashboard, and you can move through the list with j/k. Run it
   somewhere that isn't a Git repo and it tells you politely instead of crashing.
+- Each worktree now shows its real status at a glance: how many files are staged, changed, or
+  untracked, whether it's ahead of or behind its upstream, and whether its upstream branch has
+  disappeared — plus a details panel for the one you've selected. Press r to refresh.

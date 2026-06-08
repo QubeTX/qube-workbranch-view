@@ -3,6 +3,8 @@
 //! With `-z`, each attribute is NUL-terminated and records are separated by an
 //! empty (NUL-only) entry, so paths containing spaces or newlines are safe.
 
+use super::status::WorktreeStatus;
+
 /// One worktree as reported by `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorktreeRecord {
@@ -16,6 +18,9 @@ pub struct WorktreeRecord {
     pub locked: Option<String>,
     /// `Some(reason)` when prunable; the reason may be empty.
     pub prunable: Option<String>,
+    /// Working-tree status — `None` until filled by snapshot capture (the
+    /// porcelain parser leaves it unset).
+    pub status: Option<WorktreeStatus>,
 }
 
 impl WorktreeRecord {
