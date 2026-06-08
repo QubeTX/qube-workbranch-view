@@ -78,3 +78,11 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   inactive). Per-worktree git work now runs with bounded concurrency (4).
 - Review fixes: `schema.prisma` over-match tightened to `/schema.prisma`; defensive
   worktree-name fallback in collision rows.
+- Remote / pushed state: `f` runs `git fetch --all --prune` off the UI task — **explicit
+  only, never automatic** (the "not a remote hammer" rule) — with a header indicator
+  (`⟳ fetching…` / `remote <age> ago` / `remote: not checked`, updated only on success). A
+  worktree flashes green **Pushed** when its ahead-count clears to 0 while even with a live
+  upstream (heuristic, handoff §13.7).
+- Review fixes: the Pushed heuristic requires `behind == 0` + a live upstream (no
+  fetch-fast-forward false positive; reset-to-upstream ambiguity documented); a re-press of `f`
+  during an in-flight fetch is no longer silently dropped.

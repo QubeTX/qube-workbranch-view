@@ -99,6 +99,12 @@ pub struct AppState {
     pub live: LiveStatus,
     /// Archived structural events (newest first, capped) — the Timeline.
     pub archive: VecDeque<ArchivedEvent>,
+    /// Set by `apply(Fetch)`; consumed by the event loop.
+    pending_fetch: bool,
+    /// True while a `git fetch` is running (header indicator).
+    pub fetching: bool,
+    /// Epoch seconds of the last successful remote check, if any.
+    pub remote_checked: Option<u64>,
 }
 
 impl AppState {
@@ -115,6 +121,9 @@ impl AppState {
             pending_refresh: false,
             live: LiveStatus::Static,
             archive: VecDeque::new(),
+            pending_fetch: false,
+            fetching: false,
+            remote_checked: None,
         }
     }
 
@@ -162,10 +171,11 @@ impl AppState {
                         notes.push((wt.path.clone(), TransitionKind::Created));
                         new_events.push(event_from(EventKind::WorktreeCreated, wt));
                     }
-                    Some(old) if dirty_summary(old) != dirty_summary(wt) => {
-                        notes.push((wt.path.clone(), TransitionKind::Modified));
+                    Some(old) => {
+                        if let Some(kind) = change_kind(old, wt) {
+                            notes.push((wt.path.clone(), kind));
+                        }
                     }
-                    Some(_) => {}
                 }
             }
             let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
@@ -209,6 +219,21 @@ impl AppState {
         self.live = status;
     }
 
+    /// Consume the pending-fetch flag set by `apply(Action::Fetch)`.
+    pub fn take_pending_fetch(&mut self) -> bool {
+        std::mem::take(&mut self.pending_fetch)
+    }
+
+    /// Mark a fetch as in-progress (header indicator).
+    pub fn set_fetching(&mut self, fetching: bool) {
+        self.fetching = fetching;
+    }
+
+    /// Record the time of the last remote check.
+    pub fn set_remote_checked(&mut self, epoch_secs: u64) {
+        self.remote_checked = Some(epoch_secs);
+    }
+
     /// The worktrees from the current snapshot.
     pub fn worktrees(&self) -> &[WorktreeRecord] {
         &self.snapshot.worktrees
@@ -237,6 +262,7 @@ impl AppState {
             KeyCode::Tab => Action::NextTab,
             KeyCode::BackTab => Action::PrevTab,
             KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Char('f') => Action::Fetch,
             KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
             KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
             KeyCode::Char(c @ '1'..='7') => {
@@ -265,6 +291,7 @@ impl AppState {
             // The async re-capture runs in the event loop; the reducer just
             // records the intent (keeping mutation in one place).
             Action::Refresh => self.pending_refresh = true,
+            Action::Fetch => self.pending_fetch = true,
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {
@@ -290,6 +317,30 @@ fn event_from(kind: EventKind, wt: &WorktreeRecord) -> ArchivedEvent {
         wt.short_head().map(str::to_string),
         dirty,
     )
+}
+
+/// Classify how a worktree changed between snapshots: a push (ahead dropped to
+/// zero with an upstream) takes precedence over a generic modification.
+fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<TransitionKind> {
+    let old_ahead = old.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
+    let new_ahead = new.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
+    let new_behind = new.status.as_ref().and_then(|s| s.behind).unwrap_or(0);
+    let has_live_upstream = new
+        .status
+        .as_ref()
+        .is_some_and(|s| s.upstream.is_some() && !s.upstream_gone);
+    // Heuristic (handoff §13.7): ahead dropping to 0 while even with a live
+    // upstream looks like a push. Requiring behind == 0 rules out a fetch that
+    // fast-forwarded the remote past us. A hard reset to the exact upstream tip
+    // is indistinguishable here and will also flash Pushed — an accepted v1
+    // limitation (true push detection needs upstream-OID tracking).
+    if old_ahead > 0 && new_ahead == 0 && new_behind == 0 && has_live_upstream {
+        return Some(TransitionKind::Pushed);
+    }
+    if dirty_summary(old) != dirty_summary(new) {
+        return Some(TransitionKind::Modified);
+    }
+    None
 }
 
 /// The persistent dirty/divergence fingerprint used to detect changes between
@@ -446,5 +497,40 @@ mod tests {
         assert!(kinds.contains(&(EventKind::WorktreeCreated, "/repo-c")));
         assert!(kinds.contains(&(EventKind::WorktreeRemoved, "/repo-b")));
         assert_eq!(app.archive.len(), 2);
+    }
+
+    fn wt_with(ahead: u32, behind: u32, upstream: bool, gone: bool) -> WorktreeRecord {
+        WorktreeRecord {
+            path: "/r".into(),
+            status: Some(crate::git::WorktreeStatus {
+                ahead: Some(ahead),
+                behind: Some(behind),
+                upstream: upstream.then(|| "origin/main".to_string()),
+                upstream_gone: gone,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn push_flashes_when_ahead_clears_evenly() {
+        let old = wt_with(2, 0, true, false);
+        let new = wt_with(0, 0, true, false);
+        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+    }
+
+    #[test]
+    fn fetch_fast_forward_is_not_a_push() {
+        let old = wt_with(2, 0, true, false);
+        let new = wt_with(0, 3, true, false); // remote moved past us
+        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Modified));
+    }
+
+    #[test]
+    fn no_push_without_live_upstream() {
+        let old = wt_with(2, 0, true, true); // upstream gone
+        let new = wt_with(0, 0, true, true);
+        assert_ne!(change_kind(&old, &new), Some(TransitionKind::Pushed));
     }
 }

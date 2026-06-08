@@ -26,6 +26,8 @@ pub enum Action {
     MoveUp,
     /// Re-capture the repository snapshot.
     Refresh,
+    /// Fetch from remotes (`git fetch --all --prune`).
+    Fetch,
     /// Toggle the help overlay.
     ToggleHelp,
 }

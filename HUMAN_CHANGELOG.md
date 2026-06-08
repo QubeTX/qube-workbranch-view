@@ -44,3 +44,6 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   migrations, and CI configs are the scariest). There's a new Collisions tab and a ⚠ marker
   next to any worktree caught in one. It also does this work faster by checking worktrees in
   parallel.
+- Press f to fetch from your remotes — WB-300 never reaches out to the network on its own. The
+  header shows how long ago the remote was last checked, and a worktree flashes green the
+  moment its commits make it to the remote.

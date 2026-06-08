@@ -40,6 +40,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::from(" WB-300 ").bold().fg(theme::ACCENT),
         Span::from(format!("· {} ", app.repo_label())).fg(theme::DIM),
         live_indicator(app.live),
+        remote_indicator(app),
     ]);
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| Line::from(t.title())))
         .block(Block::bordered().title(title))
@@ -53,6 +54,19 @@ fn live_indicator(status: LiveStatus) -> Span<'static> {
         LiveStatus::Live => Span::from("● live ").fg(theme::CLEAN),
         LiveStatus::PollOnly => Span::from("◐ poll-only ").fg(Color::Yellow),
         LiveStatus::Static => Span::from("○ static ").fg(theme::DIM),
+    }
+}
+
+fn remote_indicator(app: &AppState) -> Span<'static> {
+    if app.fetching {
+        return Span::from("⟳ fetching… ").fg(Color::Yellow);
+    }
+    match app.remote_checked {
+        Some(epoch) => {
+            let age = crate::storage::events::epoch_secs().saturating_sub(epoch);
+            Span::from(format!("remote {} ago ", human_dur(age))).fg(theme::DIM)
+        }
+        None => Span::from("remote: not checked ").fg(theme::DIM),
     }
 }
 
@@ -527,6 +541,8 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::from("move  ").fg(theme::DIM),
         Span::from("r ").bold(),
         Span::from("refresh  ").fg(theme::DIM),
+        Span::from("f ").bold(),
+        Span::from("fetch  ").fg(theme::DIM),
         Span::from("1-7 ").bold(),
         Span::from("jump  ").fg(theme::DIM),
         Span::from("? ").bold(),
@@ -546,6 +562,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Shift+Tab  previous tab"),
         Line::from("  j / k      move selection down / up"),
         Line::from("  r          refresh the snapshot"),
+        Line::from("  f          fetch from remotes"),
         Line::from("  1 – 7      jump to a tab"),
         Line::from(""),
         Line::from("Live worktree intelligence arrives phase by phase.".fg(theme::DIM)),

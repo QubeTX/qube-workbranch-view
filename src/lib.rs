@@ -103,6 +103,7 @@ async fn run_loop(
     // loop still resets `in_flight` and never wedges the live engine.
     let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<Option<git::RepoSnapshot>>(8);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
+    let (fetch_done_tx, mut fetch_done_rx) = tokio::sync::mpsc::channel::<bool>(4);
 
     // Filesystem watcher → debouncer → refresh requests. The watcher is held for
     // its lifetime; if it can't start, the periodic poll still keeps us current.
@@ -157,6 +158,13 @@ async fn run_loop(
             Some(()) = refresh_rx.recv() => want_refresh = true,
             _ = poll.tick(), if !no_live => want_refresh = true,
             _ = anim.tick() => app.expire_transitions(),
+            Some(ok) = fetch_done_rx.recv() => {
+                app.set_fetching(false);
+                if ok {
+                    app.set_remote_checked(storage::events::epoch_secs());
+                }
+                want_refresh = true;
+            }
             Some(result) = snap_rx.recv() => {
                 in_flight = false;
                 if let Some(snapshot) = result {
@@ -170,6 +178,24 @@ async fn run_loop(
         // `r` flows through the reducer (apply → pending flag); consume it here.
         if app.take_pending_refresh() {
             want_refresh = true;
+        }
+        // `f` flows through the reducer; the fetch runs off the UI task and a
+        // re-capture follows on completion to pick up new ahead/behind state.
+        // Guard before consuming the flag so a re-press during a fetch isn't lost.
+        // (Like the capture task, a panic before the completion send would strand
+        // `fetching`; run_git returns Result and never panics, so we accept that
+        // rather than juggling a JoinHandle.)
+        if !app.fetching && app.take_pending_fetch() {
+            app.set_fetching(true);
+            let tx = fetch_done_tx.clone();
+            let root = repo.root.clone();
+            tokio::spawn(async move {
+                let ok = git::commands::run_git(Some(&root), &["fetch", "--all", "--prune"])
+                    .await
+                    .map(|out| out.success())
+                    .unwrap_or(false);
+                let _ = tx.send(ok).await;
+            });
         }
 
         // Coalesce concurrent triggers: one capture at a time, off the UI task.
