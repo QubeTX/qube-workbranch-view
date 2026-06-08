@@ -1,0 +1,11 @@
+# Keep the repository in LF and let Git normalize text on commit. text=auto
+# auto-detects binary files and leaves them untouched; eol=lf keeps the working
+# tree LF on every platform. Shell scripts in particular MUST be LF so they run
+# on Linux/macOS even when authored on the Windows dev box (e.g. deploy.sh and
+# the cargo-dist install scripts).
+* text=auto eol=lf
+
+# Windows-native scripts keep CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
