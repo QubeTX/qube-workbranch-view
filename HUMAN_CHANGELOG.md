@@ -47,3 +47,8 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 - Press f to fetch from your remotes — WB-300 never reaches out to the network on its own. The
   header shows how long ago the remote was last checked, and a worktree flashes green the
   moment its commits make it to the remote.
+- WB-300 can now help you tidy up — safely. A new Cleanup tab shows which worktrees are safe to
+  remove, which have unsaved work, and which are busy. Press / to filter the list, : for a
+  command menu, and x to remove the selected worktree — but only after you type its name to
+  confirm. If it has uncommitted changes, WB-300 saves a rescue copy first, and it will NOT
+  delete anything if saving that rescue fails. Cleaning up leftover bookkeeping also asks first.

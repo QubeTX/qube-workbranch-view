@@ -86,3 +86,13 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 - Review fixes: the Pushed heuristic requires `behind == 0` + a live upstream (no
   fetch-fast-forward false positive; reset-to-upstream ambiguity documented); a re-press of `f`
   during an in-flight fetch is no longer silently dropped.
+- Cleanup + safety + search + palette: a **Cleanup** tab scores each worktree
+  (safe / caution / dirty / active / protected) with reasons; `/` filters the worktree list,
+  `:` opens a command palette, `x` removes the selected worktree behind a **type-the-name
+  confirm** dialog (a rescue patch is saved to `<state_dir>/snapshots/` first for dirty
+  worktrees), and `p` prunes stale metadata (also confirmed). Main / current / bare worktrees
+  and any with a running process are protected. All mutations run off the UI task, behind an
+  overlay/input-mode system routed through the reducer.
+- Review fixes (data-loss focus): a failed rescue snapshot now **aborts** the removal (never
+  force-delete unrescued work); prune requires confirmation; the confirm token is typeable for
+  detached/unknown worktrees (branch → short oid → `REMOVE`).

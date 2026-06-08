@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod diff;
+pub mod ops;
 pub mod refs;
 pub mod repo;
 pub mod snapshot;

@@ -11,7 +11,8 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
 };
 
-use crate::app::{AppState, LiveStatus, Tab, TransitionKind};
+use crate::app::{AppState, Confirm, LiveStatus, Overlay, Palette, Tab, TransitionKind};
+use crate::cleanup::CleanupState;
 use crate::collision::Severity;
 use crate::git::{WorktreeRecord, WorktreeStatus};
 use crate::process::ProcessInfo;
@@ -32,6 +33,13 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
     if app.show_help {
         render_help(frame, frame.area());
+    }
+
+    match &app.overlay {
+        Overlay::Search { query } => render_search_bar(frame, frame.area(), query),
+        Overlay::Confirm(confirm) => render_confirm(frame, frame.area(), confirm),
+        Overlay::Palette(palette) => render_palette(frame, frame.area(), palette),
+        Overlay::None => {}
     }
 }
 
@@ -76,12 +84,7 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
         Tab::Worktrees => render_worktrees(frame, area, app),
         Tab::Processes => render_processes(frame, area, app),
         Tab::Collisions => render_collisions(frame, area, app),
-        Tab::Cleanup => render_placeholder(
-            frame,
-            area,
-            "Cleanup",
-            "safe cleanup candidates arrive in Phase 8.",
-        ),
+        Tab::Cleanup => render_cleanup(frame, area, app),
         Tab::Timeline => render_timeline(frame, area, app),
         Tab::Help => render_placeholder(
             frame,
@@ -139,14 +142,14 @@ fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
-    let worktrees = app.worktrees();
-    if worktrees.is_empty() {
-        render_placeholder(
-            frame,
-            area,
-            "Worktrees",
-            "no worktrees found in this repository.",
-        );
+    let visible = app.visible_indices();
+    if visible.is_empty() {
+        let note = if app.filter.is_some() {
+            "no worktrees match the filter (Esc to clear)."
+        } else {
+            "no worktrees found in this repository."
+        };
+        render_placeholder(frame, area, "Worktrees", note);
         return;
     }
 
@@ -154,10 +157,10 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
 
     let current = app.snapshot.current_worktree_index();
-    let items: Vec<ListItem> = worktrees
+    let items: Vec<ListItem> = visible
         .iter()
-        .enumerate()
-        .map(|(i, wt)| {
+        .map(|&i| {
+            let wt = &app.snapshot.worktrees[i];
             worktree_item(
                 wt,
                 Some(i) == current,
@@ -169,10 +172,18 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.selected.min(worktrees.len() - 1)));
+    state.select(Some(app.selected.min(visible.len() - 1)));
 
+    let title = match &app.filter {
+        Some(f) => format!(
+            " Worktrees ({}/{}) /{f} ",
+            visible.len(),
+            app.snapshot.worktrees.len()
+        ),
+        None => format!(" Worktrees ({}) ", visible.len()),
+    };
     let list = List::new(items)
-        .block(Block::bordered().title(format!(" Worktrees ({}) ", worktrees.len())))
+        .block(Block::bordered().title(title))
         .highlight_style(Style::new().bold().fg(theme::ACCENT))
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, list_area, &mut state);
@@ -524,6 +535,124 @@ fn severity_color(severity: Severity) -> Color {
     }
 }
 
+fn render_cleanup(frame: &mut Frame, area: Rect, app: &AppState) {
+    let mut rows: Vec<(usize, CleanupState, String)> = app
+        .snapshot
+        .worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, wt)| !wt.bare)
+        .map(|(i, wt)| {
+            let protected = i == 0 || app.snapshot.current_worktree_index() == Some(i);
+            let has_agent = app.snapshot.processes.worktree_is_active(i);
+            let (state, reason) = crate::cleanup::assess(wt, protected, has_agent);
+            (i, state, reason)
+        })
+        .collect();
+    if rows.is_empty() {
+        render_placeholder(frame, area, "Cleanup", "no worktrees to assess.");
+        return;
+    }
+    rows.sort_by_key(|(_, state, _)| state.rank());
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|(i, state, reason)| {
+            let wt = &app.snapshot.worktrees[*i];
+            ListItem::new(Line::from(vec![
+                Span::from(format!("{} ", state.glyph()))
+                    .bold()
+                    .fg(cleanup_color(*state)),
+                Span::from(wt.display_name()).bold(),
+                Span::from(format!("   {reason}")).fg(theme::DIM),
+                Span::from(format!("   {}", wt.path)).fg(theme::DIM),
+            ]))
+        })
+        .collect();
+
+    let list =
+        List::new(items).block(Block::bordered().title(
+            " Cleanup — ✓ safe · ! caution/dirty · ✗ active   (select in Worktrees, then x) ",
+        ));
+    frame.render_widget(list, area);
+}
+
+fn cleanup_color(state: CleanupState) -> Color {
+    match state {
+        CleanupState::Safe => theme::CLEAN,
+        CleanupState::Caution | CleanupState::Dirty => theme::DIRTY,
+        CleanupState::Active => theme::COLLISION,
+        CleanupState::Protected => theme::DIM,
+    }
+}
+
+fn render_search_bar(frame: &mut Frame, area: Rect, query: &str) {
+    let [_, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    frame.render_widget(Clear, bar);
+    let line = Line::from(vec![
+        Span::from(" / ").bold().fg(theme::ACCENT),
+        Span::from(query.to_string()),
+        Span::from("▌").fg(theme::ACCENT),
+        Span::from("   (Enter to keep · Esc to clear)").fg(theme::DIM),
+    ]);
+    frame.render_widget(Paragraph::new(line), bar);
+}
+
+fn render_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm) {
+    let height = (confirm.detail.len() + 6).min(20) as u16;
+    let popup = center(area, Constraint::Percentage(60), Constraint::Length(height));
+    let mut lines = vec![
+        Line::from(Span::from(confirm.title.clone()).bold().fg(Color::Red)),
+        Line::from(""),
+    ];
+    for detail in &confirm.detail {
+        lines.push(Line::from(detail.clone()));
+    }
+    lines.push(Line::from(vec![
+        Span::from("> ").fg(theme::ACCENT),
+        Span::from(confirm.typed.clone()).bold(),
+        Span::from("▌").fg(theme::ACCENT),
+    ]));
+    lines.push(Line::from(
+        Span::from("Enter to confirm · Esc to cancel").fg(theme::DIM),
+    ));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Confirm ")
+                .border_style(Style::new().fg(Color::Red)),
+        ),
+        popup,
+    );
+}
+
+fn render_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
+    let commands = crate::app::overlay::palette_filtered(&palette.query);
+    let height = (commands.len() + 2).clamp(3, 12) as u16;
+    let popup = center(area, Constraint::Percentage(50), Constraint::Length(height));
+    let items: Vec<ListItem> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| {
+            let style = if i == palette.selected {
+                Style::new().bold().fg(theme::ACCENT)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("  {}", command.label()),
+                style,
+            )))
+        })
+        .collect();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        List::new(items).block(Block::bordered().title(format!(" : {} ", palette.query))),
+        popup,
+    );
+}
+
 fn render_placeholder(frame: &mut Frame, area: Rect, title: &str, note: &str) {
     let body = Paragraph::new(format!("{title} — {note}"))
         .block(Block::bordered().title(format!(" {title} ")))
@@ -543,6 +672,12 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::from("refresh  ").fg(theme::DIM),
         Span::from("f ").bold(),
         Span::from("fetch  ").fg(theme::DIM),
+        Span::from("/ ").bold(),
+        Span::from("find  ").fg(theme::DIM),
+        Span::from(": ").bold(),
+        Span::from("cmd  ").fg(theme::DIM),
+        Span::from("x ").bold(),
+        Span::from("remove  ").fg(theme::DIM),
         Span::from("1-7 ").bold(),
         Span::from("jump  ").fg(theme::DIM),
         Span::from("? ").bold(),
@@ -552,7 +687,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = center(area, Constraint::Percentage(60), Constraint::Length(14));
+    let popup = center(area, Constraint::Percentage(60), Constraint::Length(19));
     let text = vec![
         Line::from("WB-300 — keybindings".bold()),
         Line::from(""),
@@ -563,6 +698,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  j / k      move selection down / up"),
         Line::from("  r          refresh the snapshot"),
         Line::from("  f          fetch from remotes"),
+        Line::from("  /          search / filter worktrees"),
+        Line::from("  :          command palette"),
+        Line::from("  x          remove selected worktree (type-to-confirm)"),
+        Line::from("  p          prune stale worktree metadata"),
         Line::from("  1 – 7      jump to a tab"),
         Line::from(""),
         Line::from("Live worktree intelligence arrives phase by phase.".fg(theme::DIM)),

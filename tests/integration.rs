@@ -160,3 +160,56 @@ async fn detects_collision_across_worktrees() {
     let _ = std::fs::remove_dir_all(&wt_a);
     let _ = std::fs::remove_dir_all(&wt_b);
 }
+
+#[tokio::test]
+async fn removes_clean_worktree_and_snapshots_dirty() {
+    use wb300::git::ops;
+
+    let dir = temp_dir("ops");
+    init_repo(&dir);
+
+    let wt = sibling(&dir, "rm");
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/rm",
+            wt.to_str().unwrap(),
+        ],
+    );
+    ops::remove_worktree(&dir, wt.to_str().unwrap(), false)
+        .await
+        .expect("remove clean worktree");
+    let repo = RepoIdentity::discover(&dir).await.unwrap();
+    let snap = RepoSnapshot::capture(repo).await.unwrap();
+    assert_eq!(snap.worktrees.len(), 1, "linked worktree should be gone");
+
+    let wt2 = sibling(&dir, "dirty");
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/dirty",
+            wt2.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(wt2.join("README.md"), "dirty change\n").unwrap();
+    let snaps_dir = dir.join("snapshots");
+    let patch = ops::snapshot_worktree(&wt2, &snaps_dir, "feat-dirty", 12_345)
+        .await
+        .expect("rescue snapshot");
+    let contents = std::fs::read_to_string(&patch).unwrap();
+    assert!(
+        contents.contains("README.md"),
+        "rescue patch should mention the changed file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&wt2);
+}

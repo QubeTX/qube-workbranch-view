@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::action::Action;
+use super::overlay::{Command, Confirm, Overlay, Palette, PendingGit, palette_filtered};
 use super::transitions::{TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 use crate::storage::{ArchivedEvent, DirtySummary, EventKind};
@@ -105,6 +106,12 @@ pub struct AppState {
     pub fetching: bool,
     /// Epoch seconds of the last successful remote check, if any.
     pub remote_checked: Option<u64>,
+    /// The active modal overlay (search / confirm / palette).
+    pub overlay: Overlay,
+    /// Committed worktree filter (from search).
+    pub filter: Option<String>,
+    /// A pending Git mutation for the event loop to run, if any.
+    pending_git: Option<PendingGit>,
 }
 
 impl AppState {
@@ -124,18 +131,63 @@ impl AppState {
             pending_fetch: false,
             fetching: false,
             remote_checked: None,
+            overlay: Overlay::None,
+            filter: None,
+            pending_git: None,
         }
     }
 
     /// Replace the snapshot (after a manual/live refresh), clamping selection.
     pub fn set_snapshot(&mut self, snapshot: RepoSnapshot) {
         self.snapshot = snapshot;
-        let len = self.snapshot.worktrees.len();
+        self.clamp_selection();
+    }
+
+    /// Clamp the selection to the visible (filtered) worktree count.
+    fn clamp_selection(&mut self) {
+        let len = self.visible_indices().len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
             self.selected = len - 1;
         }
+    }
+
+    /// Original worktree indices matching the active filter (all if unfiltered).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        match &self.filter {
+            None => (0..self.snapshot.worktrees.len()).collect(),
+            Some(query) => {
+                let q = query.to_lowercase();
+                self.snapshot
+                    .worktrees
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, wt)| {
+                        wt.display_name().to_lowercase().contains(&q)
+                            || wt.path.to_lowercase().contains(&q)
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        }
+    }
+
+    /// The original worktree index currently selected (within the filtered view).
+    pub fn selected_original_index(&self) -> Option<usize> {
+        self.visible_indices().get(self.selected).copied()
+    }
+
+    /// Whether worktree `idx` is protected from removal (main / current / bare).
+    fn is_protected(&self, idx: usize) -> bool {
+        idx == 0
+            || self.snapshot.current_worktree_index() == Some(idx)
+            || self.snapshot.worktrees.get(idx).is_some_and(|w| w.bare)
+    }
+
+    /// Consume a pending Git mutation for the event loop to execute.
+    pub fn take_pending_git(&mut self) -> Option<PendingGit> {
+        self.pending_git.take()
     }
 
     /// Replace the archive (loaded at startup). On disk events are oldest-first;
@@ -239,9 +291,10 @@ impl AppState {
         &self.snapshot.worktrees
     }
 
-    /// The currently selected worktree, if any.
+    /// The currently selected worktree, if any (within the filtered view).
     pub fn selected_worktree(&self) -> Option<&WorktreeRecord> {
-        self.worktrees().get(self.selected)
+        let idx = self.selected_original_index()?;
+        self.snapshot.worktrees.get(idx)
     }
 
     /// Human-readable label for the repository under inspection.
@@ -254,15 +307,28 @@ impl AppState {
     /// Bindings match the design defaults (handoff §16); the full configurable
     /// resolver arrives with the config subsystem.
     pub fn resolve_key(&self, key: KeyEvent) -> Action {
+        if matches!(self.overlay, Overlay::None) {
+            self.resolve_normal(key)
+        } else {
+            resolve_input(key)
+        }
+    }
+
+    fn resolve_normal(&self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Esc if self.show_help => Action::ToggleHelp,
+            KeyCode::Esc if self.filter.is_some() => Action::ClearFilter,
             KeyCode::Esc => Action::Quit,
             KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Tab => Action::NextTab,
             KeyCode::BackTab => Action::PrevTab,
             KeyCode::Char('r') => Action::Refresh,
             KeyCode::Char('f') => Action::Fetch,
+            KeyCode::Char('/') => Action::OpenSearch,
+            KeyCode::Char(':') => Action::OpenPalette,
+            KeyCode::Char('x') => Action::RequestRemove,
+            KeyCode::Char('p') => Action::RequestPrune,
             KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
             KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
             KeyCode::Char(c @ '1'..='7') => {
@@ -281,17 +347,27 @@ impl AppState {
             Action::NextTab => self.active_tab = self.active_tab.next(),
             Action::PrevTab => self.active_tab = self.active_tab.prev(),
             Action::SelectTab(tab) => self.active_tab = tab,
-            Action::MoveDown => {
-                let len = self.worktrees().len();
-                if len > 0 {
-                    self.selected = (self.selected + 1).min(len - 1);
-                }
-            }
-            Action::MoveUp => self.selected = self.selected.saturating_sub(1),
-            // The async re-capture runs in the event loop; the reducer just
-            // records the intent (keeping mutation in one place).
+            Action::MoveDown => self.move_selection(1),
+            Action::MoveUp => self.move_selection(-1),
+            // The async work runs in the event loop; the reducer records intent.
             Action::Refresh => self.pending_refresh = true,
             Action::Fetch => self.pending_fetch = true,
+            Action::OpenSearch => {
+                self.overlay = Overlay::Search {
+                    query: self.filter.clone().unwrap_or_default(),
+                };
+            }
+            Action::OpenPalette => self.overlay = Overlay::Palette(Palette::default()),
+            Action::ClearFilter => {
+                self.filter = None;
+                self.clamp_selection();
+            }
+            Action::RequestRemove => self.open_remove_confirm(),
+            Action::RequestPrune => self.open_prune_confirm(),
+            Action::InputChar(c) => self.input_char(c),
+            Action::InputBackspace => self.input_backspace(),
+            Action::InputSubmit => self.input_submit(),
+            Action::InputCancel => self.overlay = Overlay::None,
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {
@@ -299,6 +375,183 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Move the selection within the active list (palette or worktrees).
+    fn move_selection(&mut self, delta: i32) {
+        if let Overlay::Palette(p) = &mut self.overlay {
+            let len = palette_filtered(&p.query).len();
+            if len > 0 {
+                p.selected = (p.selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
+            }
+            return;
+        }
+        let len = self.visible_indices().len();
+        if len > 0 {
+            self.selected = (self.selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        }
+    }
+
+    fn input_char(&mut self, c: char) {
+        match &mut self.overlay {
+            Overlay::Search { query } => query.push(c),
+            Overlay::Palette(p) => {
+                p.query.push(c);
+                p.selected = 0;
+            }
+            Overlay::Confirm(cf) => cf.typed.push(c),
+            Overlay::None => {}
+        }
+        self.sync_search_filter();
+    }
+
+    fn input_backspace(&mut self) {
+        match &mut self.overlay {
+            Overlay::Search { query } => {
+                query.pop();
+            }
+            Overlay::Palette(p) => {
+                p.query.pop();
+                p.selected = 0;
+            }
+            Overlay::Confirm(cf) => {
+                cf.typed.pop();
+            }
+            Overlay::None => {}
+        }
+        self.sync_search_filter();
+    }
+
+    /// Keep the committed filter in sync with the search buffer being typed.
+    fn sync_search_filter(&mut self) {
+        let query = match &self.overlay {
+            Overlay::Search { query } => Some(query.clone()),
+            _ => None,
+        };
+        if let Some(query) = query {
+            self.filter = (!query.is_empty()).then_some(query);
+            self.clamp_selection();
+        }
+    }
+
+    fn input_submit(&mut self) {
+        match std::mem::take(&mut self.overlay) {
+            Overlay::Search { query } => {
+                self.filter = (!query.is_empty()).then_some(query);
+                self.clamp_selection();
+            }
+            Overlay::Palette(p) => {
+                if let Some(&command) = palette_filtered(&p.query).get(p.selected) {
+                    self.run_command(command);
+                }
+            }
+            Overlay::Confirm(cf) => {
+                if cf.typed.trim() == cf.expected {
+                    self.pending_git = Some(cf.action);
+                } else {
+                    self.overlay = Overlay::Confirm(cf); // wrong name — keep open
+                }
+            }
+            Overlay::None => {}
+        }
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Refresh => self.pending_refresh = true,
+            Command::Fetch => self.pending_fetch = true,
+            Command::Prune => self.open_prune_confirm(),
+            Command::RemoveSelected => self.open_remove_confirm(),
+            Command::Search => {
+                self.overlay = Overlay::Search {
+                    query: self.filter.clone().unwrap_or_default(),
+                };
+            }
+        }
+    }
+
+    /// Open a type-to-confirm dialog to remove the selected worktree, unless it
+    /// is protected or has a running process.
+    fn open_remove_confirm(&mut self) {
+        let Some(idx) = self.selected_original_index() else {
+            return;
+        };
+        if self.is_protected(idx) || self.snapshot.processes.worktree_is_active(idx) {
+            return;
+        }
+        let (path, label, expected, clean, status_line) = {
+            let Some(wt) = self.snapshot.worktrees.get(idx) else {
+                return;
+            };
+            let clean = wt.status.as_ref().is_some_and(|s| s.clean);
+            let branch = wt.branch_short().map(str::to_string);
+            // A typeable confirmation token: branch name, else short HEAD oid,
+            // else a fixed word (detached / unknown worktrees).
+            let expected = branch
+                .clone()
+                .or_else(|| wt.short_head().map(str::to_string))
+                .unwrap_or_else(|| "REMOVE".to_string());
+            let label = branch.unwrap_or_else(|| wt.display_name());
+            let status_line = wt.status.as_ref().map(|s| {
+                format!(
+                    "status: {} staged · {} unstaged · {} untracked",
+                    s.staged, s.unstaged, s.untracked
+                )
+            });
+            (wt.path.clone(), label, expected, clean, status_line)
+        };
+        let mut detail = vec![format!("path: {path}"), format!("branch: {label}")];
+        if let Some(line) = status_line {
+            detail.push(line);
+        }
+        detail.push(String::new());
+        detail.push(if clean {
+            "Clean — safe to remove.".to_string()
+        } else {
+            "DIRTY — a rescue snapshot will be saved first.".to_string()
+        });
+        detail.push(format!("Type \"{expected}\" to confirm:"));
+        self.overlay = Overlay::Confirm(Confirm {
+            title: "Remove worktree?".to_string(),
+            detail,
+            expected,
+            typed: String::new(),
+            action: PendingGit::RemoveWorktree {
+                path,
+                force: !clean,
+                snapshot_first: !clean,
+                label,
+            },
+        });
+    }
+
+    /// Open a type-to-confirm dialog to prune stale worktree metadata.
+    fn open_prune_confirm(&mut self) {
+        self.overlay = Overlay::Confirm(Confirm {
+            title: "Prune worktree metadata?".to_string(),
+            detail: vec![
+                "Removes git's bookkeeping for worktrees whose directory is gone.".to_string(),
+                "Working trees on disk are not touched.".to_string(),
+                String::new(),
+                "Type \"prune\" to confirm:".to_string(),
+            ],
+            expected: "prune".to_string(),
+            typed: String::new(),
+            action: PendingGit::Prune,
+        });
+    }
+}
+
+/// Map a key to an overlay-editing action while a modal is open.
+fn resolve_input(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::InputCancel,
+        KeyCode::Enter => Action::InputSubmit,
+        KeyCode::Backspace => Action::InputBackspace,
+        KeyCode::Up => Action::MoveUp,
+        KeyCode::Down => Action::MoveDown,
+        KeyCode::Char(c) => Action::InputChar(c),
+        _ => Action::None,
     }
 }
 

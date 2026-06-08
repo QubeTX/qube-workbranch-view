@@ -5,6 +5,7 @@
 //! reducers (added phase by phase) be unit- and integration-tested directly.
 
 pub mod app;
+pub mod cleanup;
 pub mod cli;
 pub mod collision;
 pub mod git;
@@ -198,6 +199,17 @@ async fn run_loop(
             });
         }
 
+        // Pending Git mutation (remove / prune) from a confirm dialog or palette.
+        if let Some(pending) = app.take_pending_git() {
+            let tx = refresh_tx.clone();
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                run_pending_git(&repo, pending).await;
+                // Trigger a re-capture so the change shows immediately.
+                let _ = tx.send(()).await;
+            });
+        }
+
         // Coalesce concurrent triggers: one capture at a time, off the UI task.
         if want_refresh && !in_flight {
             in_flight = true;
@@ -233,6 +245,43 @@ fn init_logging(repo: &git::RepoIdentity) {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
+}
+
+/// Run a confirmed Git mutation off the UI task: a rescue snapshot for dirty
+/// removals, then remove / prune. Failures are logged, never panicked.
+async fn run_pending_git(repo: &git::RepoIdentity, pending: app::PendingGit) {
+    match pending {
+        app::PendingGit::RemoveWorktree {
+            path,
+            force,
+            snapshot_first,
+            label,
+        } => {
+            if snapshot_first {
+                let dest = repo.state_dir().join("snapshots");
+                if let Err(err) = git::ops::snapshot_worktree(
+                    std::path::Path::new(&path),
+                    &dest,
+                    &label,
+                    storage::events::epoch_secs(),
+                )
+                .await
+                {
+                    // Never force-remove dirty work we couldn't rescue.
+                    tracing::error!("rescue snapshot failed — aborting removal: {err}");
+                    return;
+                }
+            }
+            if let Err(err) = git::ops::remove_worktree(&repo.root, &path, force).await {
+                tracing::warn!("worktree remove failed: {err}");
+            }
+        }
+        app::PendingGit::Prune => {
+            if let Err(err) = git::ops::prune_worktrees(&repo.root).await {
+                tracing::warn!("worktree prune failed: {err}");
+            }
+        }
+    }
 }
 
 /// Paths the filesystem watcher should watch: the repo root and every linked

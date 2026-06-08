@@ -28,6 +28,24 @@ pub enum Action {
     Refresh,
     /// Fetch from remotes (`git fetch --all --prune`).
     Fetch,
+    /// Open the search / filter input.
+    OpenSearch,
+    /// Open the command palette.
+    OpenPalette,
+    /// Clear the active worktree filter.
+    ClearFilter,
+    /// Request removal of the selected worktree (opens a confirm dialog).
+    RequestRemove,
+    /// Prune stale worktree metadata.
+    RequestPrune,
+    /// Type a character into the active overlay.
+    InputChar(char),
+    /// Delete the last character in the active overlay.
+    InputBackspace,
+    /// Submit the active overlay (run command / confirm / commit filter).
+    InputSubmit,
+    /// Cancel the active overlay.
+    InputCancel,
     /// Toggle the help overlay.
     ToggleHelp,
 }
