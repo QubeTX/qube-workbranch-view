@@ -39,3 +39,12 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   the snapshot.
 - Integration tests against real temporary repositories (dirty status + linked-worktree
   discovery), guarding the parsers against real-world format drift.
+- Process→worktree mapping (`sysinfo`): each process's CWD is matched to a worktree
+  (longest-prefix, path-boundary aware, case-insensitive on Windows) and classified
+  (agent / task / runtime / shell / editor), recognizing Claude/Codex/etc. by executable name
+  or via a runtime wrapper (`node …/claude.js`), with a guard against agent-named directories.
+- Processes tab: a table (pid · worktree · label · command · cpu · mem · runtime) with agent
+  rows highlighted; the Worktrees list shows a live `● <agent> pid N` badge and Overview shows
+  an active-worktree count. The scan runs off the async executor (`spawn_blocking`).
+- Unit tests for classification and prefix matching (`src/util/paths.rs`,
+  `src/process/classifier.rs`).

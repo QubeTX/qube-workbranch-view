@@ -7,8 +7,10 @@
 pub mod app;
 pub mod cli;
 pub mod git;
+pub mod process;
 pub mod terminal;
 pub mod ui;
+pub mod util;
 
 use app::{Action, AppState};
 use cli::{Cli, Command};

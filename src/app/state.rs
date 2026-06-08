@@ -166,6 +166,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::git::{RepoIdentity, WorktreeRecord};
+    use crate::process::ProcessSnapshot;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn snapshot_with(n: usize) -> RepoSnapshot {
@@ -185,6 +186,7 @@ mod tests {
             },
             worktrees,
             branches: Vec::new(),
+            processes: ProcessSnapshot::default(),
         }
     }
 

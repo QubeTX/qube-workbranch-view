@@ -8,11 +8,12 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
 };
 
 use crate::app::{AppState, Tab};
 use crate::git::{WorktreeRecord, WorktreeStatus};
+use crate::process::ProcessInfo;
 
 /// Render the whole UI for the current frame.
 pub fn render(frame: &mut Frame, app: &AppState) {
@@ -48,12 +49,7 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
     match app.active_tab {
         Tab::Overview => render_overview(frame, area, app),
         Tab::Worktrees => render_worktrees(frame, area, app),
-        Tab::Processes => render_placeholder(
-            frame,
-            area,
-            "Processes",
-            "process→worktree mapping arrives in Phase 3.",
-        ),
+        Tab::Processes => render_processes(frame, area, app),
         Tab::Collisions => render_placeholder(
             frame,
             area,
@@ -82,6 +78,9 @@ fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
         .iter()
         .filter(|wt| wt.status.as_ref().is_some_and(|st| !st.clean))
         .count();
+    let active = (0..s.worktrees.len())
+        .filter(|&i| s.processes.worktree_is_active(i))
+        .count();
     let lines = vec![
         Line::from(vec![
             Span::from("repo  ").fg(theme::DIM),
@@ -93,10 +92,12 @@ fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
                 .bold()
                 .fg(theme::ACCENT),
             Span::from(" worktrees    ").fg(theme::DIM),
+            Span::from(active.to_string()).bold().fg(theme::CLEAN),
+            Span::from(" active    ").fg(theme::DIM),
             Span::from(dirty.to_string()).bold().fg(theme::DIRTY),
             Span::from(" dirty    ").fg(theme::DIM),
             Span::from(s.local_branch_count().to_string()).bold(),
-            Span::from(" local branches    ").fg(theme::DIM),
+            Span::from(" local    ").fg(theme::DIM),
             Span::from(s.remote_branch_count().to_string()).bold(),
             Span::from(" remote-tracking").fg(theme::DIM),
         ]),
@@ -131,7 +132,13 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
     let items: Vec<ListItem> = worktrees
         .iter()
         .enumerate()
-        .map(|(i, wt)| worktree_item(wt, Some(i) == current))
+        .map(|(i, wt)| {
+            worktree_item(
+                wt,
+                Some(i) == current,
+                app.snapshot.processes.agent_for_worktree(i),
+            )
+        })
         .collect();
 
     let mut state = ListState::default();
@@ -146,10 +153,18 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
     render_worktree_details(frame, detail_area, app.selected_worktree());
 }
 
-fn worktree_item(wt: &WorktreeRecord, is_current: bool) -> ListItem<'_> {
+fn worktree_item<'a>(
+    wt: &'a WorktreeRecord,
+    is_current: bool,
+    agent: Option<&ProcessInfo>,
+) -> ListItem<'a> {
     let mut spans = vec![Span::from(wt.display_name()).bold()];
     if is_current {
         spans.push(Span::from(" (current)").fg(theme::ACCENT));
+    }
+    if let Some(agent) = agent {
+        let name = agent.name.trim_end_matches(".exe");
+        spans.push(Span::from(format!("  ● {name} pid {}", agent.pid)).fg(Color::Green));
     }
     if wt.detached {
         spans.push(Span::from(" detached").fg(Color::Magenta));
@@ -211,7 +226,6 @@ fn render_worktree_details(frame: &mut Frame, area: Rect, wt: Option<&WorktreeRe
     if let Some(head) = wt.short_head() {
         lines.push(field("head", head.to_string()));
     }
-
     if let Some(s) = &wt.status {
         if let Some(up) = &s.upstream {
             let mut spans = label("upstream");
@@ -241,7 +255,6 @@ fn render_worktree_details(frame: &mut Frame, area: Rect, wt: Option<&WorktreeRe
             ),
         ));
     }
-
     if let Some(reason) = &wt.locked {
         lines.push(field("locked", reason_or_yes(reason)));
     }
@@ -255,6 +268,55 @@ fn render_worktree_details(frame: &mut Frame, area: Rect, wt: Option<&WorktreeRe
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_processes(frame: &mut Frame, area: Rect, app: &AppState) {
+    let procs = &app.snapshot.processes.processes;
+    if procs.is_empty() {
+        render_placeholder(
+            frame,
+            area,
+            "Processes",
+            "no processes mapped to this repo's worktrees (best-effort — a process CWD may be unavailable).",
+        );
+        return;
+    }
+
+    let header = Row::new(["PID", "WORKTREE", "LABEL", "COMMAND", "CPU", "MEM", "RUN"])
+        .style(Style::new().fg(theme::DIM).bold());
+    let rows = procs.iter().map(|p| {
+        let worktree = p
+            .matched_worktree
+            .and_then(|i| app.worktrees().get(i))
+            .map_or_else(|| "-".to_string(), WorktreeRecord::display_name);
+        let row = Row::new(vec![
+            p.pid.to_string(),
+            worktree,
+            p.label.as_str().to_string(),
+            truncate_cmd(&p.cmd, 48),
+            format!("{:.0}%", p.cpu),
+            human_mem(p.memory_bytes),
+            human_dur(p.run_secs),
+        ]);
+        if p.label.is_agent() {
+            row.style(Style::new().fg(Color::Green))
+        } else {
+            row
+        }
+    });
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Min(20),
+        Constraint::Length(5),
+        Constraint::Length(8),
+        Constraint::Length(6),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(format!(" Processes ({}) ", procs.len())));
+    frame.render_widget(table, area);
 }
 
 fn label(name: &str) -> Vec<Span<'static>> {
@@ -273,6 +335,41 @@ fn reason_or_yes(reason: &str) -> String {
     } else {
         reason.to_string()
     }
+}
+
+fn human_mem(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1}gb", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{}mb", bytes / MB)
+    } else if bytes >= KB {
+        format!("{}kb", bytes / KB)
+    } else {
+        format!("{bytes}b")
+    }
+}
+
+fn human_dur(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn truncate_cmd(cmd: &str, max: usize) -> String {
+    if cmd.chars().count() <= max {
+        return cmd.to_string();
+    }
+    let kept: String = cmd.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn render_placeholder(frame: &mut Frame, area: Rect, title: &str, note: &str) {
