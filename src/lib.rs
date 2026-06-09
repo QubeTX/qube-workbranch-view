@@ -9,6 +9,7 @@ pub mod cleanup;
 pub mod cli;
 pub mod collision;
 pub mod git;
+pub mod home;
 pub mod live;
 pub mod process;
 pub mod storage;
@@ -55,16 +56,22 @@ pub async fn run(cli: Cli) -> Result<()> {
         None => std::env::current_dir()?,
     };
 
+    // `--home`/`--multi` forces the machine-wide view even inside a repo.
+    if cli.home {
+        return run_home_entry(&cli).await;
+    }
+
     let repo = match git::RepoIdentity::discover(&start_dir).await {
         Ok(repo) => repo,
         Err(err) => {
-            // Phase 10 will open the machine-wide home view here instead of exiting.
-            eprintln!("wb300: {err}");
-            eprintln!(
-                "Run wb300 inside a Git repository. (The machine-wide view for non-repo \
-                 directories arrives in a later phase.)"
-            );
-            std::process::exit(2);
+            // An explicit `--repo` that isn't a repository is a user error worth
+            // reporting; otherwise (relying on the cwd) open the home view.
+            if cli.repo.is_some() {
+                eprintln!("wb300: {err}");
+                eprintln!("The path given with --repo is not inside a Git repository.");
+                std::process::exit(2);
+            }
+            return run_home_entry(&cli).await;
         }
     };
 
@@ -238,8 +245,14 @@ async fn run_loop(
 /// Best-effort: route `tracing` diagnostics to `<state_dir>/wb300.log` so
 /// warnings (watcher/archive failures) are observable without corrupting the TUI.
 fn init_logging(repo: &git::RepoIdentity) {
-    let dir = repo.state_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    install_file_logging(&repo.state_dir());
+}
+
+/// Install a file-backed `tracing` subscriber writing to `<dir>/wb300.log`.
+/// Idempotent (`try_init`) and never fatal — logging is a convenience, not a
+/// requirement. Shared by the per-repo and home entry points.
+fn install_file_logging(dir: &std::path::Path) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let Ok(file) = std::fs::OpenOptions::new()
@@ -256,6 +269,135 @@ fn init_logging(repo: &git::RepoIdentity) {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
+}
+
+/// Entry point for the machine-wide home view: capture every active repo, then
+/// run the home event loop (or print the first repo root for the `cd` contract).
+async fn run_home_entry(cli: &Cli) -> Result<()> {
+    let config = home::HomeConfig::from_env();
+    install_file_logging(&home::home_state_dir());
+
+    let snapshot = home::HomeSnapshot::capture(&config).await;
+
+    if cli.print_selected_path {
+        // No single selection in the home view; emit the first repo root (or
+        // nothing) so the shell `cd` integration degrades gracefully.
+        if let Some(repo) = snapshot.repos.first() {
+            println!("{}", repo.repo.root.display());
+        }
+        return Ok(());
+    }
+
+    let options = terminal::TerminalOptions {
+        alt_screen: !cli.no_alt_screen,
+        mouse: false,
+    };
+    let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
+    let result = run_home_loop(&mut terminal, config, snapshot, cli.no_live).await;
+    guard.restore();
+    result
+}
+
+/// The home-view render/input loop. Mirrors [`run_loop`] at a coarser grain: a
+/// `tokio::select!` over input, a filesystem-watch refresh, a periodic rescan,
+/// an animation tick, and completed machine-wide captures (which run off the UI
+/// task). `Enter` hands control to the per-repo [`run_loop`] for the selection,
+/// then returns here and rescans.
+async fn run_home_loop(
+    terminal: &mut terminal::Tui,
+    config: home::HomeConfig,
+    snapshot: home::HomeSnapshot,
+    no_live: bool,
+) -> Result<()> {
+    let config = std::sync::Arc::new(config);
+    let mut home = home::HomeState::new(snapshot);
+
+    let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<home::HomeSnapshot>(4);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
+
+    // Filesystem watcher across every discovered worktree root (bounded by the
+    // same global cap as the per-repo watcher). The periodic rescan is the
+    // correctness backstop and also picks up newly-started/stopped agents.
+    let mut live_status = if no_live {
+        LiveStatus::Static
+    } else {
+        LiveStatus::PollOnly
+    };
+    let mut _watcher = None;
+    if !no_live {
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        match live::fs_watcher::watch(&home.snapshot.watch_paths(), raw_tx) {
+            Ok((watcher, watched)) => {
+                _watcher = Some(watcher);
+                live_status = LiveStatus::Live;
+                tracing::info!("home: watching {watched} directories");
+                tokio::spawn(live::debouncer::run(
+                    raw_rx,
+                    refresh_tx.clone(),
+                    Duration::from_millis(400),
+                ));
+            }
+            Err(err) => tracing::warn!("home watcher unavailable: {err}"),
+        }
+    }
+    home.set_live_status(live_status);
+
+    let mut poll = tokio::time::interval(Duration::from_millis(2500));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut anim = tokio::time::interval(Duration::from_millis(250));
+    let mut events = EventStream::new();
+    let mut in_flight = false;
+
+    loop {
+        terminal.draw(|frame| ui::home::render(frame, &home))?;
+        if home.should_quit {
+            break;
+        }
+
+        let mut want_refresh = false;
+        tokio::select! {
+            event = events.next() => match event {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => home.handle_key(key),
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(err.into()),
+                None => break,
+            },
+            Some(()) = refresh_rx.recv() => want_refresh = true,
+            _ = poll.tick(), if !no_live => want_refresh = true,
+            _ = anim.tick() => home.expire_transitions(),
+            Some(snapshot) = snap_rx.recv() => {
+                in_flight = false;
+                home.ingest_snapshot(snapshot);
+            }
+        }
+
+        // Drill-in: hand the terminal to the per-repo view for the selected
+        // repo, then return to the home view and rescan to pick up any change.
+        if let Some(repo_snapshot) = home.take_drill_in() {
+            run_loop(terminal, repo_snapshot, no_live).await?;
+            // While drilled in, the home `select!` wasn't draining `refresh_rx`,
+            // so the fs-watch debouncer may have queued a backlog. Drain it (and
+            // unblock the debouncer) so we do one fresh rescan, not a burst.
+            while refresh_rx.try_recv().is_ok() {}
+            want_refresh = true;
+        }
+
+        if home.take_pending_refresh() {
+            want_refresh = true;
+        }
+
+        // One rescan at a time, off the UI task.
+        if want_refresh && !in_flight {
+            in_flight = true;
+            let tx = snap_tx.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                let snapshot = home::HomeSnapshot::capture(&config).await;
+                let _ = tx.send(snapshot).await;
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Run a confirmed Git mutation off the UI task: a rescue snapshot for dirty

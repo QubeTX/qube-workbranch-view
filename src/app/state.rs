@@ -573,8 +573,9 @@ fn event_from(kind: EventKind, wt: &WorktreeRecord) -> ArchivedEvent {
 }
 
 /// Classify how a worktree changed between snapshots: a push (ahead dropped to
-/// zero with an upstream) takes precedence over a generic modification.
-fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<TransitionKind> {
+/// zero with an upstream) takes precedence over a generic modification. Shared
+/// with the home view's per-worktree flash diffing.
+pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<TransitionKind> {
     let old_ahead = old.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
     let new_ahead = new.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
     let new_behind = new.status.as_ref().and_then(|s| s.behind).unwrap_or(0);

@@ -1,6 +1,7 @@
 //! Rendering: turns [`AppState`] into a Ratatui frame. UI never runs Git or
 //! mutates state — it reads [`AppState`] and draws (handoff §8).
 
+pub mod home;
 pub mod theme;
 
 use ratatui::{

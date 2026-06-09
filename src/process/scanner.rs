@@ -1,6 +1,8 @@
 //! Scan OS processes via sysinfo and map them to worktrees. Best-effort: a CWD
 //! may be unavailable, and processes can exit between scan and display.
 
+use std::path::PathBuf;
+
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use super::classifier::classify;
@@ -62,4 +64,40 @@ pub fn scan(worktree_roots: &[String]) -> ProcessSnapshot {
     });
 
     ProcessSnapshot { processes }
+}
+
+/// Machine-wide scan for coding-agent processes (Claude / Codex / …) that
+/// expose a working directory. Returns each agent's CWD, deduplicated. The home
+/// view resolves these to their enclosing Git repositories (handoff §17.16).
+///
+/// Synchronous and possibly slow (a full process refresh) — call via
+/// `tokio::task::spawn_blocking` from async code, like [`scan`].
+pub fn scan_agent_cwds() -> Vec<PathBuf> {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+
+    let mut cwds = Vec::new();
+    for proc in sys.processes().values() {
+        let name = proc.name().to_string_lossy().to_string();
+        let cmd = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !classify(&name, &cmd).is_agent() {
+            continue;
+        }
+        if let Some(cwd) = proc.cwd() {
+            cwds.push(cwd.to_path_buf());
+        }
+    }
+
+    cwds.sort();
+    cwds.dedup();
+    cwds
 }

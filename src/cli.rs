@@ -21,6 +21,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_live: bool,
 
+    // Force the machine-wide home view even when inside a Git repository.
+    // (Without this, the home view opens automatically when run outside a repo.)
+    #[arg(long, visible_alias = "multi")]
+    pub home: bool,
+
     // Do not use the alternate screen (fallback / debug renderer).
     #[arg(long)]
     pub no_alt_screen: bool,

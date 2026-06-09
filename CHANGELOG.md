@@ -120,3 +120,20 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
   gates + scoped commit + branch push) and `tag` (clean-tree / on-main / CI-green / no-retag
   checks, then push the `vX.Y.Z` tag). README install matrix (6 channels) and the CLAUDE.md
   deploy runbook + lockstep contract updated to match.
+- Machine-wide **home view** (`src/home/`, `src/ui/home.rs`): run `wb300` outside a Git repo —
+  or with `--home` / `--multi` — to open a control tower over every repo being actively worked
+  on. Discovery is process-driven first (every repo with a running agent, via a machine-wide
+  `sysinfo` scan → `RepoIdentity::discover` of each agent's CWD) then supplemented by a bounded
+  scan of `~/git`, `~/code`, … for repos set up for parallel work (≥ 2 worktrees), deduplicated
+  by shared git dir and capped (≤ 32 repos). Each repo is captured with the full per-repo
+  pipeline; cards (active-agent repos first) break worktrees down by workbranch with agent
+  labels (`● claude pid N`), dirty/↑↓ badges, ⚠ collisions, and the same created/modified/
+  pushed/deleted colour flashes (keyed by worktree path, reusing `change_kind`). `j`/`k` select,
+  `Enter` drills into a repo's full per-repo view (returning to home on quit), `r` rescans.
+- Home live engine: a `tokio::select!` loop with a filesystem watcher across all discovered
+  worktree roots + a 2.5s rescan backstop, captures running off the UI task at bounded
+  concurrency (≤ 3 repos at once). Blocking directory enumeration runs on `spawn_blocking`;
+  the drill-in drains the watch backlog on return so it rescans once, not in a burst.
+- `--home` (alias `--multi`) flag; an explicit `--repo` pointing at a non-repository now reports
+  an error instead of silently opening the home view. Process scanner gains `scan_agent_cwds`
+  (machine-wide agent CWDs); home-mode diagnostics log to a machine-wide state dir.

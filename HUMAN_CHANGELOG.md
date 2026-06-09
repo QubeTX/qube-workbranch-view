@@ -64,3 +64,12 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 - Releasing a new version is now a single command for maintainers, split into a safe
   "prepare" step and a "ship" step, with built-in guards so a release can't go out with mismatched
   notes or before its checks pass.
+- Run WB-300 from outside any project — like your home folder — and it now opens a
+  machine-wide control tower instead of just saying "not a repo." It finds every project that's
+  being actively worked on right now (anywhere an agent like Claude or Codex is running, plus
+  projects you've set up with multiple worktrees), and shows them side by side: which agent is
+  in which workspace, what's changed, and the same live colour flashes as the single-project
+  view — so you can watch several agents across several projects at a glance. Pick a project and
+  press Enter to drop into its full view, or Esc to come back. You can also force this view from
+  inside a project with `--home`. It only ever looks at a sensible, capped set of folders, so it
+  stays light on your machine.
