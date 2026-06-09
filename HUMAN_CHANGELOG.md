@@ -73,3 +73,8 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   press Enter to drop into its full view, or Esc to come back. You can also force this view from
   inside a project with `--home`. It only ever looks at a sensible, capped set of folders, so it
   stays light on your machine.
+- New `wb300 agent` command: instead of opening the dashboard, it prints everything WB-300 knows
+  about your project as plain JSON and exits. That lets another AI assistant or a script ask
+  WB-300 for an instant, machine-readable picture — which branches and worktrees exist, which
+  agent is working where, and where things are about to collide — without a person watching a
+  screen. Add `--home` to get the same for every active project on the machine at once.

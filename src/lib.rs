@@ -4,6 +4,7 @@
 //! wrapper around [`run`]. Keeping the logic in a library lets the parsers and
 //! reducers (added phase by phase) be unit- and integration-tested directly.
 
+pub mod agent;
 pub mod app;
 pub mod cleanup;
 pub mod cli;
@@ -37,6 +38,14 @@ const ARCHIVE_MAX: usize = 2000;
 
 /// Run wb300: dispatch any subcommand, otherwise launch the live TUI.
 pub async fn run(cli: Cli) -> Result<()> {
+    // `wb300 agent`: a headless JSON snapshot for orchestrating agents.
+    // Dispatched BEFORE the panic hook and any terminal setup, so nothing — not
+    // even a panic's terminal-restore escape sequence — can contaminate the
+    // pure-JSON stdout contract.
+    if let Some(Command::Agent) = &cli.command {
+        return run_agent(&cli).await;
+    }
+
     terminal::install_panic_hook()?;
 
     if let Some(Command::Update(args)) = &cli.command {
@@ -269,6 +278,43 @@ fn install_file_logging(dir: &std::path::Path) {
         .with_ansi(false)
         .with_env_filter(filter)
         .try_init();
+}
+
+/// `wb300 agent`: capture the current repo (or the machine-wide view) and print
+/// it as JSON, no TUI. The schema is stable (`wb300.agent.v1`, see `agent.rs`).
+async fn run_agent(cli: &Cli) -> Result<()> {
+    let report = if cli.home {
+        agent_home_report().await
+    } else {
+        let start_dir = match &cli.repo {
+            Some(path) => path.clone(),
+            None => std::env::current_dir()?,
+        };
+        match git::RepoIdentity::discover(&start_dir).await {
+            Ok(repo) => {
+                let snapshot = git::RepoSnapshot::capture(repo).await?;
+                agent::Report::repo(&snapshot)
+            }
+            Err(err) => {
+                // An explicit --repo that isn't a repository is an error;
+                // otherwise fall back to the machine-wide JSON.
+                if cli.repo.is_some() {
+                    eprintln!("wb300: {err}");
+                    std::process::exit(2);
+                }
+                agent_home_report().await
+            }
+        }
+    };
+    println!("{}", report.to_json());
+    Ok(())
+}
+
+/// Capture the machine-wide view and shape it into an agent [`agent::Report`].
+async fn agent_home_report() -> agent::Report {
+    let config = home::HomeConfig::from_env();
+    let snapshot = home::HomeSnapshot::capture(&config).await;
+    agent::Report::home(&snapshot.repos, snapshot.scanned_at)
 }
 
 /// Entry point for the machine-wide home view: capture every active repo, then

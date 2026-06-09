@@ -137,3 +137,11 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 - `--home` (alias `--multi`) flag; an explicit `--repo` pointing at a non-repository now reports
   an error instead of silently opening the home view. Process scanner gains `scan_agent_cwds`
   (machine-wide agent CWDs); home-mode diagnostics log to a machine-wide state dir.
+- **`wb300 agent`** (`src/agent.rs`): a headless JSON snapshot subcommand (no TUI) for
+  orchestrating agents. Emits the full repository state — worktrees with branch/workbranch/
+  head/flags/status/collisions and mapped processes (incl. the live agent), workbranch groups,
+  branch counts, base — under a stable `"schema": "wb300.agent.v1"` contract decoupled from the
+  internal models. `"mode"` is `"repo"` (current repo) or `"home"` (machine-wide — automatic
+  outside a repo, or with `--home`). stdout is pure JSON (dispatched before the panic hook so no
+  terminal escape can leak; non-finite cpu sanitized; `repos` always present). `--repo` /
+  `--home` / `--no-color` are now global so they work after a subcommand (e.g. `agent --home`).

@@ -39,6 +39,8 @@ Ratatui is the cockpit.
   rescue snapshots before anything destructive).
 - **Machine-wide home view** — run `wb300` outside a repo to see every repo being actively
   worked on across the machine, grouped by workbranch, with the same live flashes.
+- **Headless JSON** — `wb300 agent` prints the whole state as JSON (no TUI) so orchestrating
+  agents can read the worktree/branch/agent/collision picture in one shot.
 
 ## Installation
 
@@ -93,10 +95,29 @@ cargo build --release
 cd /path/to/git/repo
 wb300                    # open the live TUI
 wb300 --repo /path/to/repo
+wb300 --home             # machine-wide view of every actively-worked-on repo
 wb300 --no-live          # static snapshot mode
 wb300 --no-alt-screen    # fallback renderer
+wb300 agent              # headless JSON snapshot (no TUI) — for other agents
+wb300 agent --home       # headless JSON for the whole machine
 wb300 update             # self-update to the latest release
 ```
+
+## Headless JSON for orchestrating agents
+
+`wb300 agent` prints the full repository state as JSON and exits — no TUI — so
+another agent (Claude, Codex, a script) can get an instant, structured view of
+the worktree / branch / workbranch / running-agent / collision picture:
+
+```sh
+wb300 agent | jq '.repo.worktrees[] | {branch, workbranch, agent: .agent.name}'
+```
+
+The output carries a stable `"schema": "wb300.agent.v1"` tag and a `"mode"` of
+`"repo"` (the current repository) or `"home"` (every active repository,
+machine-wide — used automatically outside a repo, or with `--home`). stdout is
+**pure JSON**: diagnostics and errors go to stderr, so the stream is always safe
+to parse.
 
 ## Keybindings
 

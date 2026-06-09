@@ -14,7 +14,8 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     // Path to the Git repository to open (defaults to the current directory).
-    #[arg(long, value_name = "PATH")]
+    // Global so it is also accepted after a subcommand (e.g. `agent --repo X`).
+    #[arg(long, value_name = "PATH", global = true)]
     pub repo: Option<PathBuf>,
 
     // Open in static snapshot mode (no live filesystem/process/remote engine).
@@ -23,15 +24,16 @@ pub struct Cli {
 
     // Force the machine-wide home view even when inside a Git repository.
     // (Without this, the home view opens automatically when run outside a repo.)
-    #[arg(long, visible_alias = "multi")]
+    // Global so it is also accepted after a subcommand (e.g. `agent --home`).
+    #[arg(long, visible_alias = "multi", global = true)]
     pub home: bool,
 
     // Do not use the alternate screen (fallback / debug renderer).
     #[arg(long)]
     pub no_alt_screen: bool,
 
-    // Disable colored output.
-    #[arg(long)]
+    // Disable colored output. Global so it applies to subcommands too.
+    #[arg(long, global = true)]
     pub no_color: bool,
 
     // Print the selected worktree path on exit (for shell `cd` integration).
@@ -46,6 +48,10 @@ pub struct Cli {
 pub enum Command {
     // Self-update wb300 to the latest release.
     Update(UpdateArgs),
+    // Print the full repository state as JSON and exit (no TUI) — a headless
+    // snapshot for orchestrating agents. Outside a repo (or with --home) it
+    // prints the machine-wide view of every active repository.
+    Agent,
 }
 
 #[derive(Args, Debug)]
