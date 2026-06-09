@@ -5,6 +5,10 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 
 ## Unreleased
 
+## First release
+
+Everything below is in the first public version of WB-300.
+
 ### Added
 - The first working skeleton of WB-300. It opens a full-screen terminal dashboard with tabs
   (Overview, Worktrees, Processes, Collisions, Cleanup, Help) you can move between, and it
