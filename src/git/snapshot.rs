@@ -67,10 +67,17 @@ impl RepoSnapshot {
             let base = base.clone();
             async move {
                 let status =
-                    git_stdout(Some(&path), &["status", "--porcelain=v2", "--branch", "-z"])
+                    match git_stdout(Some(&path), &["status", "--porcelain=v2", "--branch", "-z"])
                         .await
-                        .ok()
-                        .map(|bytes| parse_status_v2(&bytes));
+                    {
+                        Ok(bytes) => Some(parse_status_v2(&bytes)),
+                        // Was silently `.ok()`-dropped — a failed status used to read
+                        // as "clean" and hide that worktree's dirt and collisions.
+                        Err(err) => {
+                            tracing::warn!("status capture failed for {}: {err}", path.display());
+                            None
+                        }
+                    };
                 let touched = super::diff::touched_files(&path, base.as_deref()).await;
                 (idx, status, touched)
             }

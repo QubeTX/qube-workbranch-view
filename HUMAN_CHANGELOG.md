@@ -5,6 +5,28 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 
 ## Unreleased
 
+## Watch your agents work, live
+
+WB-300 now shows you what's happening across your worktrees as it happens, so you can glance at
+the board and feel the machine breathing:
+
+- **A blue mark pulses on a worktree while a file inside it is being saved** — and goes dark
+  within about half a second of the writing stopping. With a swarm of agents each editing
+  different files, you can literally see where the activity is and watch it hop around.
+- **A worktree's name stays yellow the whole time it has uncommitted changes**, so you can tell
+  at a glance which ones have work that hasn't been saved to history yet. (If WB-300 can't read a
+  worktree's status, its name goes grey instead of pretending it's clean.)
+- **When a worktree commits, its whole row flashes magenta; when it pushes, the row flashes
+  green** — a clear, obvious "something just shipped here" — then settles back to normal.
+- These live signals now show up on the worktree you've got selected too, not just the others.
+- The same activity, uncommitted, commit, and push signals work in the machine-wide view, so one
+  window shows you the whole fleet breathing at once.
+
+We also made the dashboard more honest about its own health: if it ever can't read Git, it now
+shows a "stale" warning in the header instead of quietly leaving old information on screen
+looking live, and problems reading a single worktree (or a whole repo, in the machine-wide view)
+are recorded to the log instead of vanishing.
+
 ## First release
 
 Everything below is in the first public version of WB-300.

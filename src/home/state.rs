@@ -136,6 +136,19 @@ impl HomeState {
         self.transitions.get(path)
     }
 
+    /// Flash live save activity for a batch of changed filesystem paths, mapping
+    /// each across every repo's worktrees (a path belongs to exactly one).
+    pub fn note_activity(&mut self, paths: &[std::path::PathBuf]) {
+        let Self {
+            snapshot,
+            transitions,
+            ..
+        } = self;
+        for repo in &snapshot.repos {
+            crate::app::state::note_activity_for(transitions, &repo.worktrees, paths);
+        }
+    }
+
     /// Swap in a freshly captured machine-wide snapshot, raising per-worktree
     /// flashes for repos seen in the previous scan (created / modified / pushed
     /// / deleted). New repos don't flash every worktree on first sight.
@@ -321,5 +334,17 @@ mod tests {
         let mut s = HomeState::new(home(vec![repo("/a", vec![ahead])]));
         s.ingest_snapshot(home(vec![repo("/a", vec![pushed])]));
         assert_eq!(s.transition_for("/a/feat"), Some(TransitionKind::Pushed));
+    }
+
+    #[test]
+    fn note_activity_flashes_the_owning_worktree_across_repos() {
+        let mut s = HomeState::new(home(vec![
+            repo("/a", vec![wt("/a/root"), wt("/a/feat")]),
+            repo("/b", vec![wt("/b/root")]),
+        ]));
+        s.note_activity(&[std::path::PathBuf::from("/a/feat/src/x.rs")]);
+        assert_eq!(s.transition_for("/a/feat"), Some(TransitionKind::Activity));
+        assert_eq!(s.transition_for("/a/root"), None);
+        assert_eq!(s.transition_for("/b/root"), None);
     }
 }

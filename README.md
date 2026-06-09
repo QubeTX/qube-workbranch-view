@@ -31,9 +31,12 @@ Ratatui is the cockpit.            ← fast, flicker-free, runs anywhere a termi
 - **Sees every agent.** It scans the OS process table, figures out which worktree each process
   is living in, and labels it — Claude/Codex agents, builds, test runs, shells, editors — with
   CPU, memory, and uptime. A green `● claude pid 1234` sits right on the worktree it's in.
-- **Updates itself, live.** Save a file and the worktree's status updates on its own and
-  briefly flashes; push and it flashes *green*; another terminal creates or deletes a worktree
-  and it notices and records it. No refresh key required (though `r` is there if you want it).
+- **Updates itself, live.** Save a file and a blue mark pulses on that worktree while it's being
+  written; its name stays *yellow* the whole time it has uncommitted work; commit and the whole
+  row flashes *magenta*, push and it flashes *green* — then it settles back. Another terminal
+  creates or deletes a worktree and it notices and records it. No refresh key required (though
+  `r` is there if you want it). If it ever can't read Git, the header says **stale** rather than
+  leaving old data looking live.
 - **Warns you before the merge hell.** It compares what every worktree has touched — including
   commits made since the shared base — and flags any file two or more worktrees have changed,
   color-coded by how scary the path is (lockfiles, migrations, and CI configs are the scariest).
