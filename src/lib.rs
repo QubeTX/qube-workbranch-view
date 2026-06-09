@@ -135,6 +135,9 @@ async fn run_loop(
     // Immediate (lossy) lane carrying changed paths for the live save marker,
     // split from the debounced refresh by the watcher's debouncer.
     let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(64);
+    // Operator-facing result messages (e.g. kill outcomes) back to the reducer,
+    // so a requested destructive action is always acknowledged on screen.
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<(String, bool)>(8);
 
     // Filesystem watcher → debouncer → refresh requests. The watcher is held for
     // its lifetime; if it can't start, the periodic poll still keeps us current.
@@ -189,6 +192,7 @@ async fn run_loop(
             },
             Some(()) = refresh_rx.recv() => want_refresh = true,
             Some(paths) = activity_rx.recv() => app.note_activity(&paths),
+            Some((text, err)) = status_rx.recv() => app.set_status(text, err),
             _ = poll.tick(), if !no_live => want_refresh = true,
             _ = anim.tick() => app.expire_transitions(),
             Some(ok) = fetch_done_rx.recv() => {
@@ -244,6 +248,37 @@ async fn run_loop(
             tokio::spawn(async move {
                 run_pending_git(&repo, pending).await;
                 // Trigger a re-capture so the change shows immediately.
+                let _ = tx.send(()).await;
+            });
+        }
+
+        // Pending process kill (confirmed by the operator) — off the UI task,
+        // then re-capture so the now-gone agent disappears from the board.
+        if let Some(kill) = app.take_pending_kill() {
+            let tx = refresh_tx.clone();
+            let stx = status_tx.clone();
+            let pid = kill.pid;
+            let short = kill.name.trim_end_matches(".exe").to_string();
+            tokio::spawn(async move {
+                let outcome =
+                    tokio::task::spawn_blocking(move || process::kill(kill.pid, &kill.name)).await;
+                let status = match outcome {
+                    Ok(Ok(())) => {
+                        tracing::info!("terminated process {pid} on request");
+                        (format!("✓ terminated {short} (pid {pid})"), false)
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!("kill of process {pid} failed: {err}");
+                        (format!("⚠ kill failed: {err}"), true)
+                    }
+                    Err(err) => {
+                        tracing::warn!("kill task for process {pid} panicked: {err}");
+                        ("⚠ kill failed: internal error".to_string(), true)
+                    }
+                };
+                // Surface the outcome on screen, then re-capture so a killed
+                // process leaves the board.
+                let _ = stx.send(status).await;
                 let _ = tx.send(()).await;
             });
         }

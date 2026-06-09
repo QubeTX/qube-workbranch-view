@@ -21,9 +21,14 @@ pub fn scan(worktree_roots: &[String]) -> ProcessSnapshot {
     );
 
     let norm_roots: Vec<String> = worktree_roots.iter().map(|r| normalize(r)).collect();
+    let self_pid = std::process::id();
     let mut processes = Vec::new();
 
     for proc in sys.processes().values() {
+        // Never list wb300 itself — it shouldn't be a killable row in its own UI.
+        if proc.pid().as_u32() == self_pid {
+            continue;
+        }
         let cwd = proc.cwd().map(|p| p.to_path_buf());
         let Some(matched) = cwd
             .as_ref()
@@ -100,4 +105,56 @@ pub fn scan_agent_cwds() -> Vec<PathBuf> {
     cwds.sort();
     cwds.dedup();
     cwds
+}
+
+/// Best-effort terminate a process by PID, **only** on explicit user request —
+/// wb300 never kills a process on its own. Re-confirms the live process still
+/// has `expected_name` before signalling, so a PID reused between the confirm
+/// dialog and the kill is refused rather than killing the wrong thing. Returns
+/// `Ok(())` once the signal is sent. Synchronous (a quick OS call) — invoke via
+/// `tokio::task::spawn_blocking` from async code.
+pub fn kill(pid: u32, expected_name: &str) -> Result<(), String> {
+    // Hard guard: never let the operator terminate wb300 out from under itself.
+    if pid == std::process::id() {
+        return Err("refusing to terminate wb300 itself".to_string());
+    }
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let Some(proc) = sys.process(spid) else {
+        return Err(format!("process {pid} is no longer running"));
+    };
+    let name = proc.name().to_string_lossy().to_string();
+    if name != expected_name {
+        return Err(format!(
+            "process {pid} is now '{name}', not '{expected_name}' — aborting (PID reused)"
+        ));
+    }
+    if proc.kill() {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not terminate process {pid} (permission denied?)"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_of_a_nonexistent_pid_errors() {
+        // u32::MAX is not a live PID; kill must refuse, not panic.
+        assert!(kill(u32::MAX, "ghost.exe").is_err());
+    }
+
+    #[test]
+    fn kill_refuses_to_terminate_wb300_itself() {
+        assert!(kill(std::process::id(), "whatever").is_err());
+    }
 }

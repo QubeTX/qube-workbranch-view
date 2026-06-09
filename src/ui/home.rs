@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use super::theme;
-use crate::app::{LiveStatus, TransitionKind};
+use crate::app::LiveStatus;
 use crate::git::{RepoSnapshot, WorktreeRecord, WorktreeStatus};
 use crate::home::{HomeState, repo_name, workbranch_label};
 
@@ -164,55 +164,46 @@ fn render_repo_detail(frame: &mut Frame, area: Rect, home: &HomeState) {
     frame.render_widget(p, area);
 }
 
-/// One worktree row: a flash marker, branch, agent badge, dirty/divergence
-/// badges, and a collision marker.
+/// One worktree row: a leading live-activity dot (its own colour), then the body
+/// — branch, agent badge, status badges, collision marker — which takes the
+/// persistent state colour (whole-line yellow while uncommitted) or a milestone
+/// flash colour (magenta committed / green pushed) over the entire row.
 fn worktree_line(home: &HomeState, repo: &RepoSnapshot, idx: usize) -> Line<'static> {
     let wt = &repo.worktrees[idx];
     let transition = home.transition_for(&wt.path);
-    let mut spans = vec![flash_marker(transition), Span::from(" ")];
-    // Name carries persistent state: yellow while uncommitted, dim when status
-    // is unknown (a failed `git status` must not read as clean).
-    let mut name = Span::from(wt.display_name());
-    match wt.status.as_ref() {
-        Some(s) if !s.clean => name = name.fg(theme::DIRTY),
-        None => name = name.fg(theme::DIM),
-        Some(_) => {}
-    }
-    spans.push(name);
 
+    let mut body = vec![Span::from(wt.display_name())];
     if let Some(agent) = repo.processes.agent_for_worktree(idx) {
-        spans.push(Span::from(format!("  ● {} pid {}", agent.name, agent.pid)).fg(theme::CLEAN));
+        body.push(Span::from(format!("  ● {} pid {}", agent.name, agent.pid)).fg(theme::CLEAN));
     }
-
-    spans.extend(status_badges(wt.status.as_ref()));
-
+    body.extend(status_badges(wt.status.as_ref()));
     let collisions = repo
         .collisions
         .iter()
         .filter(|c| c.worktrees.contains(&idx))
         .count();
     if collisions > 0 {
-        spans.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
+        body.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
     }
-    // A commit/push milestone briefly recolors the whole row one solid colour.
-    if let Some(color) = super::milestone_color(transition) {
-        let recolored: Vec<Span> = spans.into_iter().map(|s| s.fg(color)).collect();
+
+    let dot = super::activity_dot(transition);
+
+    // A commit/push milestone, OR uncommitted state, recolors the ENTIRE row —
+    // dot included — so an actively-edited uncommitted worktree is all yellow.
+    // Milestone flashes take precedence.
+    let line_color =
+        super::milestone_color(transition).or_else(|| super::uncommitted_color(wt.status.as_ref()));
+    if let Some(color) = line_color {
+        let recolored: Vec<Span> = std::iter::once(dot)
+            .chain(body)
+            .map(|s| s.fg(color))
+            .collect();
         return Line::from(recolored);
     }
+    // Clean: the dot keeps its own live colour (blue ◆ while editing, dim · idle).
+    let mut spans = vec![dot];
+    spans.extend(body);
     Line::from(spans)
-}
-
-/// A coloured marker for the worktree's active transition (dim dot if none).
-/// Milestones recolor the whole row instead, so they show no distinct marker.
-fn flash_marker(kind: Option<TransitionKind>) -> Span<'static> {
-    match kind {
-        Some(TransitionKind::Activity) => Span::from("◆").fg(theme::ACTIVITY),
-        Some(TransitionKind::Created) => Span::from("●").fg(theme::CLEAN),
-        Some(TransitionKind::Deleted) => Span::from("●").fg(theme::COLLISION),
-        Some(TransitionKind::Committed) | Some(TransitionKind::Pushed) | None => {
-            Span::from("·").fg(theme::DIM)
-        }
-    }
 }
 
 fn status_badges(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
@@ -309,11 +300,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(
-            Span::from("Live: blue ◆ a file is being saved · a name turns yellow while uncommitted.")
+            Span::from("Live: ◆ a file is being saved (blue when clean) · the whole line is yellow while uncommitted.")
                 .fg(theme::DIM),
         ),
         Line::from(
-            Span::from("Milestones recolor the row: magenta committed · green pushed (● created · red removed).")
+            Span::from("Milestones flash the row: magenta committed · green pushed · ✚ created · ⌫ removed.")
                 .fg(theme::DIM),
         ),
     ];

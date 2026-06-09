@@ -16,6 +16,21 @@ pub enum PendingGit {
     Prune,
 }
 
+/// A process the user has explicitly confirmed terminating. Run off the UI task;
+/// wb300 never kills a process on its own.
+#[derive(Debug, Clone)]
+pub struct PendingKill {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// What an accepted [`Confirm`] dialog runs.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    Git(PendingGit),
+    Kill(PendingKill),
+}
+
 /// A modal overlay captured above the normal key bindings.
 #[derive(Debug, Clone, Default)]
 pub enum Overlay {
@@ -36,7 +51,7 @@ pub struct Confirm {
     pub detail: Vec<String>,
     pub expected: String,
     pub typed: String,
-    pub action: PendingGit,
+    pub action: ConfirmAction,
 }
 
 /// Command-palette state.

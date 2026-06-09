@@ -6,6 +6,6 @@ pub mod state;
 pub mod transitions;
 
 pub use action::Action;
-pub use overlay::{Command, Confirm, Overlay, Palette, PendingGit};
+pub use overlay::{Command, Confirm, ConfirmAction, Overlay, Palette, PendingGit, PendingKill};
 pub use state::{AppState, LiveStatus, Tab};
 pub use transitions::{TransitionKind, Transitions};
