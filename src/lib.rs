@@ -132,6 +132,9 @@ async fn run_loop(
     let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<Option<git::RepoSnapshot>>(8);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
     let (fetch_done_tx, mut fetch_done_rx) = tokio::sync::mpsc::channel::<bool>(4);
+    // Immediate (lossy) lane carrying changed paths for the live save marker,
+    // split from the debounced refresh by the watcher's debouncer.
+    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(64);
 
     // Filesystem watcher → debouncer → refresh requests. The watcher is held for
     // its lifetime; if it can't start, the periodic poll still keeps us current.
@@ -142,7 +145,7 @@ async fn run_loop(
     };
     let mut _watcher = None;
     if !no_live {
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
         match live::fs_watcher::watch(&watch_paths(&app.snapshot), raw_tx) {
             Ok((watcher, watched)) => {
                 _watcher = Some(watcher);
@@ -150,6 +153,7 @@ async fn run_loop(
                 tracing::info!("watching {watched} directories");
                 tokio::spawn(live::debouncer::run(
                     raw_rx,
+                    activity_tx.clone(),
                     refresh_tx.clone(),
                     Duration::from_millis(300),
                 ));
@@ -184,6 +188,7 @@ async fn run_loop(
                 None => break,
             },
             Some(()) = refresh_rx.recv() => want_refresh = true,
+            Some(paths) = activity_rx.recv() => app.note_activity(&paths),
             _ = poll.tick(), if !no_live => want_refresh = true,
             _ = anim.tick() => app.expire_transitions(),
             Some(ok) = fetch_done_rx.recv() => {
@@ -195,10 +200,16 @@ async fn run_loop(
             }
             Some(result) = snap_rx.recv() => {
                 in_flight = false;
-                if let Some(snapshot) = result {
-                    for event in app.ingest_snapshot(snapshot) {
-                        let _ = event_writer.send(event);
+                match result {
+                    Some(snapshot) => {
+                        app.set_stale(false);
+                        for event in app.ingest_snapshot(snapshot) {
+                            let _ = event_writer.send(event);
+                        }
                     }
+                    // Capture failed: mark stale so the header stops claiming
+                    // "live" while showing data that may now be wrong.
+                    None => app.set_stale(true),
                 }
             }
         }
@@ -243,7 +254,15 @@ async fn run_loop(
             let tx = snap_tx.clone();
             let repo = repo.clone();
             tokio::spawn(async move {
-                let result = git::RepoSnapshot::capture(repo).await.ok();
+                // Log the failure (was silently `.ok()`-dropped) so a wedged Git
+                // subprocess is diagnosable; the `None` drives the stale flag.
+                let result = match git::RepoSnapshot::capture(repo).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(err) => {
+                        tracing::warn!("snapshot capture failed (showing stale state): {err}");
+                        None
+                    }
+                };
                 let _ = tx.send(result).await;
             });
         }
@@ -360,6 +379,7 @@ async fn run_home_loop(
 
     let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<home::HomeSnapshot>(4);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
+    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(64);
 
     // Filesystem watcher across every discovered worktree root (bounded by the
     // same global cap as the per-repo watcher). The periodic rescan is the
@@ -371,7 +391,7 @@ async fn run_home_loop(
     };
     let mut _watcher = None;
     if !no_live {
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
         match live::fs_watcher::watch(&home.snapshot.watch_paths(), raw_tx) {
             Ok((watcher, watched)) => {
                 _watcher = Some(watcher);
@@ -379,6 +399,7 @@ async fn run_home_loop(
                 tracing::info!("home: watching {watched} directories");
                 tokio::spawn(live::debouncer::run(
                     raw_rx,
+                    activity_tx.clone(),
                     refresh_tx.clone(),
                     Duration::from_millis(400),
                 ));
@@ -409,6 +430,7 @@ async fn run_home_loop(
                 None => break,
             },
             Some(()) = refresh_rx.recv() => want_refresh = true,
+            Some(paths) = activity_rx.recv() => home.note_activity(&paths),
             _ = poll.tick(), if !no_live => want_refresh = true,
             _ = anim.tick() => home.expire_transitions(),
             Some(snapshot) = snap_rx.recv() => {
@@ -425,6 +447,9 @@ async fn run_home_loop(
             // so the fs-watch debouncer may have queued a backlog. Drain it (and
             // unblock the debouncer) so we do one fresh rescan, not a burst.
             while refresh_rx.try_recv().is_ok() {}
+            // Likewise drop any queued activity batches so we don't replay stale
+            // save-pulses for events that happened during the drill-in.
+            while activity_rx.try_recv().is_ok() {}
             want_refresh = true;
         }
 

@@ -112,6 +112,9 @@ pub struct AppState {
     pub filter: Option<String>,
     /// A pending Git mutation for the event loop to run, if any.
     pending_git: Option<PendingGit>,
+    /// True when the most recent snapshot capture failed — the board is showing
+    /// stale data. Surfaced in the header so "live" never silently lies.
+    pub stale: bool,
 }
 
 impl AppState {
@@ -134,6 +137,7 @@ impl AppState {
             overlay: Overlay::None,
             filter: None,
             pending_git: None,
+            stale: false,
         }
     }
 
@@ -256,6 +260,11 @@ impl AppState {
         self.transitions.get(path)
     }
 
+    /// Flash live save activity for a batch of changed filesystem paths.
+    pub fn note_activity(&mut self, paths: &[std::path::PathBuf]) {
+        note_activity_for(&mut self.transitions, &self.snapshot.worktrees, paths);
+    }
+
     /// Drop expired transient highlights (driven by the animation tick).
     pub fn expire_transitions(&mut self) {
         self.transitions.expire();
@@ -269,6 +278,11 @@ impl AppState {
     /// Record whether live updating is active (set once by the event loop).
     pub fn set_live_status(&mut self, status: LiveStatus) {
         self.live = status;
+    }
+
+    /// Record whether the most recent snapshot capture failed (header flag).
+    pub fn set_stale(&mut self, stale: bool) {
+        self.stale = stale;
     }
 
     /// Consume the pending-fetch flag set by `apply(Action::Fetch)`.
@@ -572,9 +586,11 @@ fn event_from(kind: EventKind, wt: &WorktreeRecord) -> ArchivedEvent {
     )
 }
 
-/// Classify how a worktree changed between snapshots: a push (ahead dropped to
-/// zero with an upstream) takes precedence over a generic modification. Shared
-/// with the home view's per-worktree flash diffing.
+/// Classify how a worktree changed between snapshots into a *milestone* flash:
+/// a push (ahead drained to zero against a live upstream) takes precedence over
+/// a commit (HEAD moved). Returns `None` for lesser changes — live save activity
+/// is flashed separately by the filesystem watcher, and "has uncommitted work"
+/// is a persistent highlight, not a flash. Shared with the home view's diffing.
 pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<TransitionKind> {
     let old_ahead = old.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
     let new_ahead = new.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
@@ -583,33 +599,42 @@ pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<
         .status
         .as_ref()
         .is_some_and(|s| s.upstream.is_some() && !s.upstream_gone);
-    // Heuristic (handoff §13.7): ahead dropping to 0 while even with a live
-    // upstream looks like a push. Requiring behind == 0 rules out a fetch that
-    // fast-forwarded the remote past us. A hard reset to the exact upstream tip
-    // is indistinguishable here and will also flash Pushed — an accepted v1
-    // limitation (true push detection needs upstream-OID tracking).
+    // Heuristic (handoff §13.7): ahead dropping to 0 with a live upstream looks
+    // like a push. Requiring behind == 0 rules out a fetch that fast-forwarded
+    // the remote past us. A hard reset to the exact upstream tip is
+    // indistinguishable and also flashes Pushed — an accepted v1 limitation
+    // (true push detection needs upstream-OID tracking).
     if old_ahead > 0 && new_ahead == 0 && new_behind == 0 && has_live_upstream {
         return Some(TransitionKind::Pushed);
     }
-    if dirty_summary(old) != dirty_summary(new) {
-        return Some(TransitionKind::Modified);
+    // A moved HEAD is a commit. Heuristic: a reset / rebase / checkout / merge
+    // also moves HEAD and will flash Committed — accepted for v1 (true commit
+    // detection needs reflog tracking). Only when both HEADs are known, so we
+    // never flash on missing data (a bare worktree has no HEAD oid).
+    if let (Some(old_head), Some(new_head)) = (&old.head, &new.head)
+        && old_head != new_head
+    {
+        return Some(TransitionKind::Committed);
     }
     None
 }
 
-/// The persistent dirty/divergence fingerprint used to detect changes between
-/// snapshots. A `None` status compares as all-zero.
-fn dirty_summary(wt: &WorktreeRecord) -> (usize, usize, usize, usize, u32, u32) {
-    match &wt.status {
-        Some(s) => (
-            s.staged,
-            s.unstaged,
-            s.untracked,
-            s.conflicted,
-            s.ahead.unwrap_or(0),
-            s.behind.unwrap_or(0),
-        ),
-        None => (0, 0, 0, 0, 0, 0),
+/// Flash a blue `Activity` marker on the worktree containing each changed path.
+/// Driven by the (un-debounced) filesystem watcher so the marker tracks live
+/// save state. Paths that fall outside every known worktree are ignored. Shared
+/// by the per-repo and home reducers.
+pub(crate) fn note_activity_for(
+    transitions: &mut Transitions,
+    worktrees: &[WorktreeRecord],
+    paths: &[std::path::PathBuf],
+) {
+    use crate::util::paths::{longest_prefix_match, normalize};
+    let roots: Vec<String> = worktrees.iter().map(|w| normalize(&w.path)).collect();
+    for path in paths {
+        let probe = normalize(&path.to_string_lossy());
+        if let Some(idx) = longest_prefix_match(&probe, &roots) {
+            transitions.note(worktrees[idx].path.clone(), TransitionKind::Activity);
+        }
     }
 }
 
@@ -775,10 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn fetch_fast_forward_is_not_a_push() {
+    fn fetch_fast_forward_is_not_a_push_or_commit() {
         let old = wt_with(2, 0, true, false);
         let new = wt_with(0, 3, true, false); // remote moved past us
-        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Modified));
+        // Neither a push (behind != 0) nor a commit (HEAD unchanged): remote
+        // drift is a persistent badge, not a flash.
+        assert_eq!(change_kind(&old, &new), None);
     }
 
     #[test]
@@ -786,5 +813,57 @@ mod tests {
         let old = wt_with(2, 0, true, true); // upstream gone
         let new = wt_with(0, 0, true, true);
         assert_ne!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+    }
+
+    fn wt_head(head: &str) -> WorktreeRecord {
+        WorktreeRecord {
+            path: "/r".into(),
+            head: Some(head.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn moved_head_flashes_committed() {
+        assert_eq!(
+            change_kind(&wt_head("aaaaaaaa"), &wt_head("bbbbbbbb")),
+            Some(TransitionKind::Committed)
+        );
+    }
+
+    #[test]
+    fn unchanged_head_is_no_flash() {
+        assert_eq!(
+            change_kind(&wt_head("aaaaaaaa"), &wt_head("aaaaaaaa")),
+            None
+        );
+    }
+
+    #[test]
+    fn push_takes_precedence_over_a_moved_head() {
+        // A commit that is simultaneously pushed reads as the louder Pushed.
+        let mut old = wt_with(2, 0, true, false);
+        old.head = Some("aaaaaaaa".into());
+        let mut new = wt_with(0, 0, true, false);
+        new.head = Some("bbbbbbbb".into());
+        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+    }
+
+    #[test]
+    fn note_activity_flashes_the_containing_worktree() {
+        let mut app = AppState::new(snapshot_paths(&["/repo/main", "/repo/feat"]));
+        app.note_activity(&[std::path::PathBuf::from("/repo/feat/src/lib.rs")]);
+        assert_eq!(
+            app.transition_for("/repo/feat"),
+            Some(TransitionKind::Activity)
+        );
+        assert_eq!(app.transition_for("/repo/main"), None);
+    }
+
+    #[test]
+    fn note_activity_ignores_paths_outside_any_worktree() {
+        let mut app = AppState::new(snapshot_paths(&["/repo/main"]));
+        app.note_activity(&[std::path::PathBuf::from("/elsewhere/x.rs")]);
+        assert_eq!(app.transition_for("/repo/main"), None);
     }
 }

@@ -36,19 +36,22 @@ const IGNORED_DIRS: &[&str] = &[
 /// pathological trees; anything past this is caught by the periodic poll.
 const MAX_WATCH_DIRS: usize = 2048;
 
-/// Watch the pruned source tree under each root, sending `()` on every relevant
-/// change. The returned watcher must be kept alive for watching to continue;
-/// the `usize` is how many directories ended up watched (for diagnostics).
+/// Watch the pruned source tree under each root, sending the changed paths on
+/// every relevant change. The returned watcher must be kept alive for watching
+/// to continue; the `usize` is how many directories ended up watched (for
+/// diagnostics). Consumers split the stream into an immediate "live save"
+/// activity lane and a coalesced refresh (see [`crate::live::debouncer`]).
 pub fn watch(
     roots: &[PathBuf],
-    tx: UnboundedSender<()>,
+    tx: UnboundedSender<Vec<PathBuf>>,
 ) -> notify::Result<(RecommendedWatcher, usize)> {
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res
             && is_relevant(&event)
         {
+            // Forward the changed paths (un-debounced) for the live save marker.
             // Unbounded + non-blocking: safe to call from notify's own thread.
-            let _ = tx.send(());
+            let _ = tx.send(event.paths);
         }
     })?;
 

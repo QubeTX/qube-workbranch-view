@@ -168,8 +168,17 @@ fn render_repo_detail(frame: &mut Frame, area: Rect, home: &HomeState) {
 /// badges, and a collision marker.
 fn worktree_line(home: &HomeState, repo: &RepoSnapshot, idx: usize) -> Line<'static> {
     let wt = &repo.worktrees[idx];
-    let mut spans = vec![flash_marker(home.transition_for(&wt.path)), Span::from(" ")];
-    spans.push(Span::from(wt.display_name()));
+    let transition = home.transition_for(&wt.path);
+    let mut spans = vec![flash_marker(transition), Span::from(" ")];
+    // Name carries persistent state: yellow while uncommitted, dim when status
+    // is unknown (a failed `git status` must not read as clean).
+    let mut name = Span::from(wt.display_name());
+    match wt.status.as_ref() {
+        Some(s) if !s.clean => name = name.fg(theme::DIRTY),
+        None => name = name.fg(theme::DIM),
+        Some(_) => {}
+    }
+    spans.push(name);
 
     if let Some(agent) = repo.processes.agent_for_worktree(idx) {
         spans.push(Span::from(format!("  ● {} pid {}", agent.name, agent.pid)).fg(theme::CLEAN));
@@ -185,17 +194,24 @@ fn worktree_line(home: &HomeState, repo: &RepoSnapshot, idx: usize) -> Line<'sta
     if collisions > 0 {
         spans.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
     }
+    // A commit/push milestone briefly recolors the whole row one solid colour.
+    if let Some(color) = super::milestone_color(transition) {
+        let recolored: Vec<Span> = spans.into_iter().map(|s| s.fg(color)).collect();
+        return Line::from(recolored);
+    }
     Line::from(spans)
 }
 
-/// A coloured dot for the worktree's active transition flash (dim dot if none).
+/// A coloured marker for the worktree's active transition (dim dot if none).
+/// Milestones recolor the whole row instead, so they show no distinct marker.
 fn flash_marker(kind: Option<TransitionKind>) -> Span<'static> {
     match kind {
+        Some(TransitionKind::Activity) => Span::from("◆").fg(theme::ACTIVITY),
         Some(TransitionKind::Created) => Span::from("●").fg(theme::CLEAN),
-        Some(TransitionKind::Modified) => Span::from("●").fg(theme::DIRTY),
-        Some(TransitionKind::Pushed) => Span::from("●").fg(theme::ACCENT),
         Some(TransitionKind::Deleted) => Span::from("●").fg(theme::COLLISION),
-        None => Span::from("·").fg(theme::DIM),
+        Some(TransitionKind::Committed) | Some(TransitionKind::Pushed) | None => {
+            Span::from("·").fg(theme::DIM)
+        }
     }
 }
 
@@ -293,10 +309,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(
-            Span::from("Dots flash as worktrees change: green created · yellow modified")
+            Span::from("Live: blue ◆ a file is being saved · a name turns yellow while uncommitted.")
                 .fg(theme::DIM),
         ),
-        Line::from(Span::from("· cyan pushed · red deleted.").fg(theme::DIM)),
+        Line::from(
+            Span::from("Milestones recolor the row: magenta committed · green pushed (● created · red removed).")
+                .fg(theme::DIM),
+        ),
     ];
     let popup = centered_rect(72, 70, area);
     frame.render_widget(Clear, popup);

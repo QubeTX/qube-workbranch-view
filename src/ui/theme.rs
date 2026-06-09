@@ -11,5 +11,9 @@ pub const DIM: Color = Color::DarkGray;
 pub const DIRTY: Color = Color::Yellow;
 /// Collision / conflict state.
 pub const COLLISION: Color = Color::Red;
-/// Clean / synced state.
+/// Clean / synced state — also the "pushed" milestone flash.
 pub const CLEAN: Color = Color::Green;
+/// Live file-save activity marker.
+pub const ACTIVITY: Color = Color::Blue;
+/// "Committed" milestone flash (HEAD moved).
+pub const COMMITTED: Color = Color::Magenta;

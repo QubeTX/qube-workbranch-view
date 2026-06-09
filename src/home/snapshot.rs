@@ -30,14 +30,22 @@ impl HomeSnapshot {
     pub async fn capture(config: &HomeConfig) -> Self {
         let ids = discover_active_repos(config).await;
 
-        let mut repos: Vec<RepoSnapshot> = futures_util::stream::iter(
-            ids.into_iter()
-                .map(|id| async move { RepoSnapshot::capture(id).await.ok() }),
-        )
-        .buffer_unordered(HOME_CAPTURE_CONCURRENCY)
-        .filter_map(|r| async move { r })
-        .collect()
-        .await;
+        let mut repos: Vec<RepoSnapshot> =
+            futures_util::stream::iter(ids.into_iter().map(|id| async move {
+                // Log rather than silently drop a repo whose capture failed, so a
+                // wedged repo disappearing from the board is at least diagnosable.
+                match RepoSnapshot::capture(id).await {
+                    Ok(snap) => Some(snap),
+                    Err(err) => {
+                        tracing::warn!("home: repo capture failed, dropping from view: {err}");
+                        None
+                    }
+                }
+            }))
+            .buffer_unordered(HOME_CAPTURE_CONCURRENCY)
+            .filter_map(|r| async move { r })
+            .collect()
+            .await;
 
         // Surface repos with a live agent first (the control-tower thesis), then
         // alphabetically — a stable, predictable card order across refreshes.

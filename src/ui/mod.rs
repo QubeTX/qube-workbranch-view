@@ -45,12 +45,17 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
-    let title = Line::from(vec![
+    let mut head = vec![
         Span::from(" WB-300 ").bold().fg(theme::ACCENT),
         Span::from(format!("· {} ", app.repo_label())).fg(theme::DIM),
         live_indicator(app.live),
-        remote_indicator(app),
-    ]);
+    ];
+    if app.stale {
+        // A capture failed — say so rather than letting "● live" imply fresh data.
+        head.push(Span::from("⚠ stale ").bold().fg(theme::COLLISION));
+    }
+    head.push(remote_indicator(app));
+    let title = Line::from(head);
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| Line::from(t.title())))
         .block(Block::bordered().title(title))
         .select(app.active_tab.index())
@@ -185,7 +190,10 @@ fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
     };
     let list = List::new(items)
         .block(Block::bordered().title(title))
-        .highlight_style(Style::new().bold().fg(theme::ACCENT))
+        // Bold + the ▸ cursor mark the selection WITHOUT overriding the row's own
+        // foreground, so live flashes (activity / commit / push) and the
+        // uncommitted-yellow name stay visible on the selected row too.
+        .highlight_style(Style::new().bold())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, list_area, &mut state);
 
@@ -200,10 +208,21 @@ fn worktree_item<'a>(
     collisions: usize,
 ) -> ListItem<'a> {
     let mut spans = Vec::new();
-    if let Some(kind) = transition {
-        spans.push(transition_marker(kind));
+    if let Some(kind) = transition
+        && let Some(marker) = transition_marker(kind)
+    {
+        spans.push(marker);
     }
-    spans.push(Span::from(wt.display_name()).bold());
+    // The name carries persistent worktree state: yellow while it has
+    // uncommitted work, dim when its status is unknown (a failed `git status`
+    // must read as "unknown", never as clean), normal when known-clean.
+    let mut name = Span::from(wt.display_name()).bold();
+    match wt.status.as_ref() {
+        Some(s) if !s.clean => name = name.fg(theme::DIRTY),
+        None => name = name.fg(theme::DIM),
+        Some(_) => {}
+    }
+    spans.push(name);
     if is_current {
         spans.push(Span::from(" (current)").fg(theme::ACCENT));
     }
@@ -224,16 +243,32 @@ fn worktree_item<'a>(
         spans.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
     }
     spans.extend(status_badges(wt.status.as_ref()));
+    // A commit/push milestone briefly recolors the entire row one solid colour.
+    if let Some(color) = milestone_color(transition) {
+        let recolored: Vec<Span> = spans.into_iter().map(|s| s.fg(color)).collect();
+        return ListItem::new(Line::from(recolored));
+    }
     ListItem::new(Line::from(spans))
 }
 
-/// A short-lived "flash" glyph for a just-changed worktree.
-fn transition_marker(kind: TransitionKind) -> Span<'static> {
+/// A short-lived "flash" glyph for a just-changed worktree. Milestones
+/// (`Committed`/`Pushed`) recolor the whole row instead — see [`milestone_color`].
+fn transition_marker(kind: TransitionKind) -> Option<Span<'static>> {
     match kind {
-        TransitionKind::Created => Span::from("✚ ").fg(Color::Cyan),
-        TransitionKind::Modified => Span::from("✎ ").fg(theme::DIRTY),
-        TransitionKind::Pushed => Span::from("↑ ").fg(theme::CLEAN),
-        TransitionKind::Deleted => Span::from("⌫ ").fg(theme::COLLISION),
+        TransitionKind::Activity => Some(Span::from("◆ ").fg(theme::ACTIVITY)),
+        TransitionKind::Created => Some(Span::from("✚ ").fg(Color::Cyan)),
+        TransitionKind::Deleted => Some(Span::from("⌫ ").fg(theme::COLLISION)),
+        TransitionKind::Committed | TransitionKind::Pushed => None,
+    }
+}
+
+/// The solid colour a milestone flash recolors the whole row with, if any
+/// (magenta = just committed, green = just pushed). Shared with the home view.
+pub(crate) fn milestone_color(kind: Option<TransitionKind>) -> Option<Color> {
+    match kind {
+        Some(TransitionKind::Committed) => Some(theme::COMMITTED),
+        Some(TransitionKind::Pushed) => Some(theme::CLEAN),
+        _ => None,
     }
 }
 
@@ -721,4 +756,106 @@ fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
         .areas(area);
     let [area] = Layout::vertical([vertical]).flex(Flex::Center).areas(area);
     area
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::app::TransitionKind;
+    use crate::git::{RepoIdentity, RepoSnapshot};
+    use crate::process::ProcessSnapshot;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn snapshot(worktrees: Vec<WorktreeRecord>) -> RepoSnapshot {
+        RepoSnapshot {
+            repo: RepoIdentity {
+                start_dir: "/repo".into(),
+                root: "/repo".into(),
+                git_dir: "/repo/.git".into(),
+                common_git_dir: "/repo/.git".into(),
+                is_worktree: false,
+            },
+            base: None,
+            worktrees,
+            branches: Vec::new(),
+            collisions: Vec::new(),
+            processes: ProcessSnapshot::default(),
+        }
+    }
+
+    /// A worktree on branch `feat`; `clean` toggles a single staged change so a
+    /// dirty case has no yellow *badge* (staged is blue) — only the name carries
+    /// the persistent-uncommitted yellow.
+    fn wt(path: &str, clean: bool) -> WorktreeRecord {
+        WorktreeRecord {
+            path: path.into(),
+            branch: Some("refs/heads/feat".into()),
+            status: Some(WorktreeStatus {
+                clean,
+                staged: if clean { 0 } else { 1 },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn app_on_worktrees(worktrees: Vec<WorktreeRecord>) -> AppState {
+        let mut app = AppState::new(snapshot(worktrees));
+        app.active_tab = Tab::Worktrees;
+        app
+    }
+
+    fn render_buffer(app: &AppState) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn has_fg(buf: &Buffer, color: Color) -> bool {
+        buf.content().iter().any(|c| c.fg == color)
+    }
+
+    fn has_symbol(buf: &Buffer, needle: &str) -> bool {
+        buf.content().iter().any(|c| c.symbol() == needle)
+    }
+
+    #[test]
+    fn dirty_worktree_name_is_held_yellow() {
+        let app = app_on_worktrees(vec![wt("/repo", false)]);
+        assert!(has_fg(&render_buffer(&app), theme::DIRTY));
+    }
+
+    #[test]
+    fn clean_worktree_shows_no_uncommitted_yellow() {
+        let app = app_on_worktrees(vec![wt("/repo", true)]);
+        assert!(!has_fg(&render_buffer(&app), theme::DIRTY));
+    }
+
+    #[test]
+    fn activity_renders_a_blue_marker() {
+        let mut app = app_on_worktrees(vec![wt("/repo", false)]);
+        app.note_activity(&[std::path::PathBuf::from("/repo/src/x.rs")]);
+        let buf = render_buffer(&app);
+        assert!(has_symbol(&buf, "◆"), "expected the blue activity marker");
+        assert!(has_fg(&buf, theme::ACTIVITY));
+    }
+
+    #[test]
+    fn commit_flash_recolors_the_row_magenta() {
+        let mut app = app_on_worktrees(vec![wt("/repo", true)]);
+        app.transitions
+            .note("/repo".into(), TransitionKind::Committed);
+        assert!(has_fg(&render_buffer(&app), theme::COMMITTED));
+    }
+
+    #[test]
+    fn push_flash_recolors_the_row_green() {
+        // Dirty (so no "clean" green badge) and live=Static (so no green "● live"):
+        // the only green in the pane can come from the push recolor.
+        let mut app = app_on_worktrees(vec![wt("/repo", false)]);
+        app.transitions.note("/repo".into(), TransitionKind::Pushed);
+        assert!(has_fg(&render_buffer(&app), theme::CLEAN));
+    }
 }
