@@ -8,9 +8,9 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-06-08
+## [1.0.0] - 2026-06-08
 
-First public release. Everything below shipped in the initial `v0.1.0`.
+First public release. Everything below shipped in `v1.0.0`.
 
 ### Added
 - Project scaffold: cross-platform Rust + Ratatui TUI skeleton (`wb300`, edition 2024) with a

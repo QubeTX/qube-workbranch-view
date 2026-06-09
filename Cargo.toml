@@ -1,6 +1,6 @@
 [package]
 name = "wb300"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 # Edition 2024 (the latest). Editions are per-crate language epochs, not version
 # or dependency constraints — they only need Rust >= 1.85. MSRV is pinned in
