@@ -1,17 +1,23 @@
 //! The application state and its reducer.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::action::Action;
-use super::overlay::{Command, Confirm, Overlay, Palette, PendingGit, palette_filtered};
+use super::overlay::{
+    Command, Confirm, ConfirmAction, Overlay, Palette, PendingGit, PendingKill, palette_filtered,
+};
 use super::transitions::{TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 use crate::storage::{ArchivedEvent, DirtySummary, EventKind};
 
 /// In-memory cap on archived events (matches the on-disk prune cap).
 const MAX_ARCHIVE: usize = 2000;
+
+/// How long a transient operator status message (e.g. a kill result) stays up.
+const STATUS_TTL: Duration = Duration::from_millis(5000);
 
 /// Top-level views. Mirrors the design's tab set; Timeline arrives with the
 /// event archive in a later phase (handoff §14.2).
@@ -44,7 +50,7 @@ impl Tab {
             Tab::Overview => "Overview",
             Tab::Worktrees => "Worktrees",
             Tab::Processes => "Processes",
-            Tab::Collisions => "Collisions",
+            Tab::Collisions => "Merge Risk",
             Tab::Cleanup => "Cleanup",
             Tab::Timeline => "Timeline",
             Tab::Help => "Help",
@@ -112,9 +118,19 @@ pub struct AppState {
     pub filter: Option<String>,
     /// A pending Git mutation for the event loop to run, if any.
     pending_git: Option<PendingGit>,
+    /// A pending process kill for the event loop to run, if any.
+    pending_kill: Option<PendingKill>,
+    /// Selected row in the Processes tab.
+    pub proc_selected: usize,
     /// True when the most recent snapshot capture failed — the board is showing
     /// stale data. Surfaced in the header so "live" never silently lies.
     pub stale: bool,
+    /// Epoch seconds of the last successful snapshot ingest — drives the
+    /// Overview "updated Ns ago" freshness line.
+    pub last_updated: Option<u64>,
+    /// A transient operator-facing result message (e.g. a kill outcome), shown
+    /// briefly in the footer: `(text, raised_at, is_error)`.
+    status: Option<(String, Instant, bool)>,
 }
 
 impl AppState {
@@ -137,7 +153,11 @@ impl AppState {
             overlay: Overlay::None,
             filter: None,
             pending_git: None,
+            pending_kill: None,
+            proc_selected: 0,
             stale: false,
+            last_updated: None,
+            status: None,
         }
     }
 
@@ -145,6 +165,7 @@ impl AppState {
     pub fn set_snapshot(&mut self, snapshot: RepoSnapshot) {
         self.snapshot = snapshot;
         self.clamp_selection();
+        self.clamp_proc_selection();
     }
 
     /// Clamp the selection to the visible (filtered) worktree count.
@@ -182,16 +203,43 @@ impl AppState {
         self.visible_indices().get(self.selected).copied()
     }
 
-    /// Whether worktree `idx` is protected from removal (main / current / bare).
+    /// Whether worktree `idx` is protected from removal: the primary checkout
+    /// (index 0), the current worktree, a bare repo, or any `main`/`master`
+    /// branch worktree (the integration target must never be removable).
     fn is_protected(&self, idx: usize) -> bool {
         idx == 0
             || self.snapshot.current_worktree_index() == Some(idx)
-            || self.snapshot.worktrees.get(idx).is_some_and(|w| w.bare)
+            || self.snapshot.worktrees.get(idx).is_some_and(|w| {
+                w.bare || matches!(w.branch_short(), Some("main") | Some("master"))
+            })
     }
 
     /// Consume a pending Git mutation for the event loop to execute.
     pub fn take_pending_git(&mut self) -> Option<PendingGit> {
         self.pending_git.take()
+    }
+
+    /// Consume a pending process kill for the event loop to execute.
+    pub fn take_pending_kill(&mut self) -> Option<PendingKill> {
+        self.pending_kill.take()
+    }
+
+    /// Clamp the Processes-tab selection to the mapped-process count.
+    pub fn clamp_proc_selection(&mut self) {
+        let len = self.snapshot.processes.processes.len();
+        if len == 0 {
+            self.proc_selected = 0;
+        } else if self.proc_selected >= len {
+            self.proc_selected = len - 1;
+        }
+    }
+
+    fn move_proc_selection(&mut self, delta: i32) {
+        let len = self.snapshot.processes.processes.len();
+        if len > 0 {
+            self.proc_selected =
+                (self.proc_selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        }
     }
 
     /// Replace the archive (loaded at startup). On disk events are oldest-first;
@@ -213,7 +261,7 @@ impl AppState {
     /// return the newly-detected events for the caller to persist.
     pub fn ingest_snapshot(&mut self, new: RepoSnapshot) -> Vec<ArchivedEvent> {
         let mut new_events: Vec<ArchivedEvent> = Vec::new();
-        let mut notes: Vec<(String, TransitionKind)> = Vec::new();
+        let mut notes: Vec<(String, Vec<TransitionKind>)> = Vec::new();
         {
             let previous: HashMap<&str, &WorktreeRecord> = self
                 .snapshot
@@ -224,12 +272,13 @@ impl AppState {
             for wt in &new.worktrees {
                 match previous.get(wt.path.as_str()) {
                     None => {
-                        notes.push((wt.path.clone(), TransitionKind::Created));
+                        notes.push((wt.path.clone(), vec![TransitionKind::Created]));
                         new_events.push(event_from(EventKind::WorktreeCreated, wt));
                     }
                     Some(old) => {
-                        if let Some(kind) = change_kind(old, wt) {
-                            notes.push((wt.path.clone(), kind));
+                        let kinds = change_kind(old, wt);
+                        if !kinds.is_empty() {
+                            notes.push((wt.path.clone(), kinds));
                         }
                     }
                 }
@@ -237,14 +286,39 @@ impl AppState {
             let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
             for old in &self.snapshot.worktrees {
                 if !old.bare && !incoming.contains(old.path.as_str()) {
-                    notes.push((old.path.clone(), TransitionKind::Deleted));
+                    notes.push((old.path.clone(), vec![TransitionKind::Deleted]));
                     new_events.push(event_from(EventKind::WorktreeRemoved, old));
+                }
+            }
+            // New merge-conflict-risk pairings (a file changed on a worktree SET
+            // not flagged last snapshot) → log once. Keyed by file + the worktree
+            // paths involved, so a re-paired conflict (A×B → A×C) re-logs.
+            let old_conflicts: HashSet<String> = self
+                .snapshot
+                .collisions
+                .iter()
+                .map(|c| conflict_key(c, &self.snapshot.worktrees))
+                .collect();
+            for c in &new.collisions {
+                if !old_conflicts.contains(&conflict_key(c, &new.worktrees)) {
+                    let who: Vec<String> = c
+                        .worktrees
+                        .iter()
+                        .filter_map(|&i| new.worktrees.get(i).map(WorktreeRecord::display_name))
+                        .collect();
+                    new_events.push(ArchivedEvent::new(
+                        EventKind::ConflictRisk,
+                        c.file.clone(),
+                        Some(who.join(" × ")),
+                        None,
+                        None,
+                    ));
                 }
             }
         }
 
-        for (path, kind) in notes {
-            self.transitions.note(path, kind);
+        for (path, seq) in notes {
+            self.transitions.note_seq(path, seq);
         }
         // Prepend so the archive stays newest-first; reverse keeps in-batch order.
         for event in new_events.iter().rev() {
@@ -252,6 +326,7 @@ impl AppState {
         }
         self.truncate_archive();
         self.set_snapshot(new);
+        self.last_updated = Some(crate::storage::events::epoch_secs());
         new_events
     }
 
@@ -265,9 +340,29 @@ impl AppState {
         note_activity_for(&mut self.transitions, &self.snapshot.worktrees, paths);
     }
 
-    /// Drop expired transient highlights (driven by the animation tick).
+    /// Drop expired transient highlights and status message (animation tick).
     pub fn expire_transitions(&mut self) {
         self.transitions.expire();
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|(_, at, _)| at.elapsed() >= STATUS_TTL)
+        {
+            self.status = None;
+        }
+    }
+
+    /// Raise a transient operator-facing status message (e.g. a kill result).
+    pub fn set_status(&mut self, text: String, is_error: bool) {
+        self.status = Some((text, Instant::now(), is_error));
+    }
+
+    /// The active status message `(text, is_error)`, if not yet expired.
+    pub fn status(&self) -> Option<(&str, bool)> {
+        self.status
+            .as_ref()
+            .filter(|(_, at, _)| at.elapsed() < STATUS_TTL)
+            .map(|(text, _, err)| (text.as_str(), *err))
     }
 
     /// Consume the pending-refresh flag set by `apply(Action::Refresh)`.
@@ -343,8 +438,18 @@ impl AppState {
             KeyCode::Char(':') => Action::OpenPalette,
             KeyCode::Char('x') => Action::RequestRemove,
             KeyCode::Char('p') => Action::RequestPrune,
-            KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
-            KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
+            KeyCode::Char('K') => match self.active_tab {
+                Tab::Processes => Action::RequestKillProcess,
+                _ => Action::RequestKillAgent,
+            },
+            KeyCode::Char('j') | KeyCode::Down => match self.active_tab {
+                Tab::Processes => Action::ProcessDown,
+                _ => Action::MoveDown,
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.active_tab {
+                Tab::Processes => Action::ProcessUp,
+                _ => Action::MoveUp,
+            },
             KeyCode::Char(c @ '1'..='7') => {
                 let idx = (c as u8 - b'1') as usize;
                 Action::SelectTab(Tab::ALL[idx])
@@ -378,6 +483,10 @@ impl AppState {
             }
             Action::RequestRemove => self.open_remove_confirm(),
             Action::RequestPrune => self.open_prune_confirm(),
+            Action::RequestKillAgent => self.open_kill_agent_confirm(),
+            Action::RequestKillProcess => self.open_kill_process_confirm(),
+            Action::ProcessDown => self.move_proc_selection(1),
+            Action::ProcessUp => self.move_proc_selection(-1),
             Action::InputChar(c) => self.input_char(c),
             Action::InputBackspace => self.input_backspace(),
             Action::InputSubmit => self.input_submit(),
@@ -461,9 +570,12 @@ impl AppState {
             }
             Overlay::Confirm(cf) => {
                 if cf.typed.trim() == cf.expected {
-                    self.pending_git = Some(cf.action);
+                    match cf.action {
+                        ConfirmAction::Git(g) => self.pending_git = Some(g),
+                        ConfirmAction::Kill(k) => self.pending_kill = Some(k),
+                    }
                 } else {
-                    self.overlay = Overlay::Confirm(cf); // wrong name — keep open
+                    self.overlay = Overlay::Confirm(cf); // wrong token — keep open
                 }
             }
             Overlay::None => {}
@@ -522,7 +634,7 @@ impl AppState {
         detail.push(if clean {
             "Clean — safe to remove.".to_string()
         } else {
-            "DIRTY — a rescue snapshot will be saved first.".to_string()
+            "UNCOMMITTED — a rescue snapshot will be saved first.".to_string()
         });
         detail.push(format!("Type \"{expected}\" to confirm:"));
         self.overlay = Overlay::Confirm(Confirm {
@@ -530,12 +642,12 @@ impl AppState {
             detail,
             expected,
             typed: String::new(),
-            action: PendingGit::RemoveWorktree {
+            action: ConfirmAction::Git(PendingGit::RemoveWorktree {
                 path,
                 force: !clean,
                 snapshot_first: !clean,
                 label,
-            },
+            }),
         });
     }
 
@@ -551,8 +663,69 @@ impl AppState {
             ],
             expected: "prune".to_string(),
             typed: String::new(),
-            action: PendingGit::Prune,
+            action: ConfirmAction::Git(PendingGit::Prune),
         });
+    }
+
+    /// Open a type-the-PID-to-confirm dialog to kill the agent attached to the
+    /// selected worktree (for a forgotten / stuck background agent).
+    fn open_kill_agent_confirm(&mut self) {
+        let Some(idx) = self.selected_original_index() else {
+            return;
+        };
+        let Some(agent) = self.snapshot.processes.agent_for_worktree(idx) else {
+            return;
+        };
+        let pid = agent.pid;
+        let name = agent.name.clone();
+        let cwd = agent.cwd.as_ref().map(|p| p.display().to_string());
+        let wt = self
+            .snapshot
+            .worktrees
+            .get(idx)
+            .map_or_else(String::new, WorktreeRecord::display_name);
+        self.overlay = Overlay::Confirm(kill_confirm(pid, &name, cwd.as_deref(), &wt));
+    }
+
+    /// Open a type-the-PID-to-confirm dialog to kill the selected Processes-tab
+    /// process.
+    fn open_kill_process_confirm(&mut self) {
+        let Some(proc) = self.snapshot.processes.processes.get(self.proc_selected) else {
+            return;
+        };
+        let pid = proc.pid;
+        let name = proc.name.clone();
+        let cwd = proc.cwd.as_ref().map(|p| p.display().to_string());
+        let wt = proc
+            .matched_worktree
+            .and_then(|i| self.snapshot.worktrees.get(i))
+            .map_or_else(String::new, WorktreeRecord::display_name);
+        self.overlay = Overlay::Confirm(kill_confirm(pid, &name, cwd.as_deref(), &wt));
+    }
+}
+
+/// Build a type-the-PID-to-confirm dialog for terminating a process.
+fn kill_confirm(pid: u32, name: &str, cwd: Option<&str>, worktree: &str) -> Confirm {
+    let short = name.trim_end_matches(".exe");
+    let mut detail = vec![format!("process: {short}  pid {pid}")];
+    if !worktree.is_empty() {
+        detail.push(format!("worktree: {worktree}"));
+    }
+    if let Some(cwd) = cwd {
+        detail.push(format!("cwd: {cwd}"));
+    }
+    detail.push(String::new());
+    detail.push("Terminates the process — for forgotten or stuck agents.".to_string());
+    detail.push(format!("Type {pid} to confirm:"));
+    Confirm {
+        title: "Kill process?".to_string(),
+        detail,
+        expected: pid.to_string(),
+        typed: String::new(),
+        action: ConfirmAction::Kill(PendingKill {
+            pid,
+            name: name.to_string(),
+        }),
     }
 }
 
@@ -567,6 +740,20 @@ fn resolve_input(key: KeyEvent) -> Action {
         KeyCode::Char(c) => Action::InputChar(c),
         _ => Action::None,
     }
+}
+
+/// A stable identity for a collision: its file plus the sorted worktree PATHS
+/// involved (paths, not indices — indices shift as worktrees come and go). Lets
+/// the Timeline treat a re-paired conflict (A×B → A×C) as a new event.
+fn conflict_key(c: &crate::collision::Collision, worktrees: &[WorktreeRecord]) -> String {
+    let mut paths: Vec<&str> = c
+        .worktrees
+        .iter()
+        .filter_map(|&i| worktrees.get(i))
+        .map(|w| w.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    format!("{}\u{1f}{}", c.file, paths.join("\u{1f}"))
 }
 
 /// Build an [`ArchivedEvent`] from a worktree's last-known state.
@@ -591,7 +778,7 @@ fn event_from(kind: EventKind, wt: &WorktreeRecord) -> ArchivedEvent {
 /// a commit (HEAD moved). Returns `None` for lesser changes — live save activity
 /// is flashed separately by the filesystem watcher, and "has uncommitted work"
 /// is a persistent highlight, not a flash. Shared with the home view's diffing.
-pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<TransitionKind> {
+pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Vec<TransitionKind> {
     let old_ahead = old.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
     let new_ahead = new.status.as_ref().and_then(|s| s.ahead).unwrap_or(0);
     let new_behind = new.status.as_ref().and_then(|s| s.behind).unwrap_or(0);
@@ -599,24 +786,30 @@ pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Option<
         .status
         .as_ref()
         .is_some_and(|s| s.upstream.is_some() && !s.upstream_gone);
-    // Heuristic (handoff §13.7): ahead dropping to 0 with a live upstream looks
-    // like a push. Requiring behind == 0 rules out a fetch that fast-forwarded
-    // the remote past us. A hard reset to the exact upstream tip is
-    // indistinguishable and also flashes Pushed — an accepted v1 limitation
-    // (true push detection needs upstream-OID tracking).
-    if old_ahead > 0 && new_ahead == 0 && new_behind == 0 && has_live_upstream {
-        return Some(TransitionKind::Pushed);
+    // HEAD moved between snapshots → a commit landed. (A reset / rebase /
+    // checkout / merge also moves HEAD and will read as Committed — accepted v1
+    // heuristic.) Only when both HEADs are known, so we never flash on missing
+    // data (a bare worktree has no HEAD oid).
+    let head_moved = matches!((&old.head, &new.head), (Some(o), Some(n)) if o != n);
+    // In sync with a live upstream now (ahead/behind both zero).
+    let now_synced = new_ahead == 0 && new_behind == 0 && has_live_upstream;
+
+    // A commit that also leaves us synced with a live upstream is a back-to-back
+    // commit+push: play magenta then green (handoff §13.7). A hard reset to the
+    // upstream tip is indistinguishable and also plays this — accepted limit.
+    if head_moved && now_synced {
+        return vec![TransitionKind::Committed, TransitionKind::Pushed];
     }
-    // A moved HEAD is a commit. Heuristic: a reset / rebase / checkout / merge
-    // also moves HEAD and will flash Committed — accepted for v1 (true commit
-    // detection needs reflog tracking). Only when both HEADs are known, so we
-    // never flash on missing data (a bare worktree has no HEAD oid).
-    if let (Some(old_head), Some(new_head)) = (&old.head, &new.head)
-        && old_head != new_head
-    {
-        return Some(TransitionKind::Committed);
+    // Ahead drained to 0 against a live upstream with HEAD unchanged → a pure
+    // push. behind == 0 rules out a fetch that fast-forwarded the remote past us.
+    if old_ahead > 0 && now_synced {
+        return vec![TransitionKind::Pushed];
     }
-    None
+    // HEAD moved but not yet synced → a commit not yet pushed.
+    if head_moved {
+        return vec![TransitionKind::Committed];
+    }
+    Vec::new()
 }
 
 /// Flash a blue `Activity` marker on the worktree containing each changed path.
@@ -642,7 +835,7 @@ pub(crate) fn note_activity_for(
 mod tests {
     use super::*;
     use crate::git::{RepoIdentity, WorktreeRecord};
-    use crate::process::ProcessSnapshot;
+    use crate::process::{ProcessInfo, ProcessLabel, ProcessSnapshot};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn snapshot_with(n: usize) -> RepoSnapshot {
@@ -778,6 +971,54 @@ mod tests {
         assert_eq!(app.archive.len(), 2);
     }
 
+    fn snapshot_with_conflict(paths: &[&str]) -> RepoSnapshot {
+        use crate::collision::{Collision, Severity};
+        let mut s = snapshot_paths(paths);
+        s.collisions = vec![Collision {
+            file: "src/x.rs".into(),
+            worktrees: vec![0, 1],
+            severity: Severity::Medium,
+        }];
+        s
+    }
+
+    #[test]
+    fn ingest_archives_a_new_conflict_risk_event() {
+        let mut app = AppState::new(snapshot_paths(&["/repo-a", "/repo-b"]));
+        let events = app.ingest_snapshot(snapshot_with_conflict(&["/repo-a", "/repo-b"]));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == EventKind::ConflictRisk && e.path == "src/x.rs")
+        );
+    }
+
+    #[test]
+    fn an_existing_conflict_is_not_re_archived() {
+        let mut app = AppState::new(snapshot_paths(&["/repo-a", "/repo-b"]));
+        app.ingest_snapshot(snapshot_with_conflict(&["/repo-a", "/repo-b"])); // first → logged
+        let events = app.ingest_snapshot(snapshot_with_conflict(&["/repo-a", "/repo-b"]));
+        assert!(!events.iter().any(|e| e.kind == EventKind::ConflictRisk)); // still present → quiet
+    }
+
+    #[test]
+    fn a_re_paired_conflict_is_logged_again() {
+        use crate::collision::{Collision, Severity};
+        let with = |worktrees: Vec<usize>| -> RepoSnapshot {
+            let mut s = snapshot_paths(&["/repo-a", "/repo-b", "/repo-c"]);
+            s.collisions = vec![Collision {
+                file: "src/x.rs".into(),
+                worktrees,
+                severity: Severity::Medium,
+            }];
+            s
+        };
+        let mut app = AppState::new(snapshot_paths(&["/repo-a", "/repo-b", "/repo-c"]));
+        app.ingest_snapshot(with(vec![0, 1])); // A×B logged
+        let events = app.ingest_snapshot(with(vec![0, 2])); // A×C — new pairing, re-logged
+        assert!(events.iter().any(|e| e.kind == EventKind::ConflictRisk));
+    }
+
     fn wt_with(ahead: u32, behind: u32, upstream: bool, gone: bool) -> WorktreeRecord {
         WorktreeRecord {
             path: "/r".into(),
@@ -796,7 +1037,7 @@ mod tests {
     fn push_flashes_when_ahead_clears_evenly() {
         let old = wt_with(2, 0, true, false);
         let new = wt_with(0, 0, true, false);
-        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+        assert_eq!(change_kind(&old, &new), vec![TransitionKind::Pushed]);
     }
 
     #[test]
@@ -805,14 +1046,14 @@ mod tests {
         let new = wt_with(0, 3, true, false); // remote moved past us
         // Neither a push (behind != 0) nor a commit (HEAD unchanged): remote
         // drift is a persistent badge, not a flash.
-        assert_eq!(change_kind(&old, &new), None);
+        assert!(change_kind(&old, &new).is_empty());
     }
 
     #[test]
     fn no_push_without_live_upstream() {
         let old = wt_with(2, 0, true, true); // upstream gone
         let new = wt_with(0, 0, true, true);
-        assert_ne!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+        assert!(change_kind(&old, &new).is_empty());
     }
 
     fn wt_head(head: &str) -> WorktreeRecord {
@@ -827,26 +1068,27 @@ mod tests {
     fn moved_head_flashes_committed() {
         assert_eq!(
             change_kind(&wt_head("aaaaaaaa"), &wt_head("bbbbbbbb")),
-            Some(TransitionKind::Committed)
+            vec![TransitionKind::Committed]
         );
     }
 
     #[test]
     fn unchanged_head_is_no_flash() {
-        assert_eq!(
-            change_kind(&wt_head("aaaaaaaa"), &wt_head("aaaaaaaa")),
-            None
-        );
+        assert!(change_kind(&wt_head("aaaaaaaa"), &wt_head("aaaaaaaa")).is_empty());
     }
 
     #[test]
-    fn push_takes_precedence_over_a_moved_head() {
-        // A commit that is simultaneously pushed reads as the louder Pushed.
+    fn commit_then_push_plays_committed_then_pushed() {
+        // A commit that also leaves us synced with a live upstream → the
+        // back-to-back sequence: magenta (committed) then green (pushed).
         let mut old = wt_with(2, 0, true, false);
         old.head = Some("aaaaaaaa".into());
         let mut new = wt_with(0, 0, true, false);
         new.head = Some("bbbbbbbb".into());
-        assert_eq!(change_kind(&old, &new), Some(TransitionKind::Pushed));
+        assert_eq!(
+            change_kind(&old, &new),
+            vec![TransitionKind::Committed, TransitionKind::Pushed]
+        );
     }
 
     #[test]
@@ -865,5 +1107,75 @@ mod tests {
         let mut app = AppState::new(snapshot_paths(&["/repo/main"]));
         app.note_activity(&[std::path::PathBuf::from("/elsewhere/x.rs")]);
         assert_eq!(app.transition_for("/repo/main"), None);
+    }
+
+    fn agent_proc(pid: u32, wt: usize) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent: None,
+            name: "claude.exe".into(),
+            cmd: "claude.exe".into(),
+            cwd: Some("/repo-0".into()),
+            label: ProcessLabel::Agent,
+            cpu: 0.0,
+            memory_bytes: 0,
+            run_secs: 0,
+            matched_worktree: Some(wt),
+        }
+    }
+
+    fn app_with_agent(pid: u32) -> AppState {
+        let mut snap = snapshot_with(1);
+        snap.processes = ProcessSnapshot {
+            processes: vec![agent_proc(pid, 0)],
+        };
+        let mut app = AppState::new(snap);
+        app.active_tab = Tab::Worktrees;
+        app
+    }
+
+    #[test]
+    fn main_and_master_worktrees_are_protected_from_removal() {
+        let mut snap = snapshot_paths(&["/repo/wt-a", "/repo/feat", "/repo/wt-c"]);
+        snap.worktrees[0].branch = Some("refs/heads/main".into());
+        snap.worktrees[1].branch = Some("refs/heads/feat".into());
+        snap.worktrees[2].branch = Some("refs/heads/master".into());
+        let app = AppState::new(snap);
+        assert!(app.is_protected(0)); // primary checkout (also main)
+        assert!(!app.is_protected(1)); // a normal task worktree — removable
+        assert!(app.is_protected(2)); // master branch — never removable
+    }
+
+    #[test]
+    fn k_on_worktrees_requests_killing_the_agent() {
+        let app = app_with_agent(4242);
+        assert_eq!(
+            app.resolve_key(key(KeyCode::Char('K'))),
+            Action::RequestKillAgent
+        );
+    }
+
+    #[test]
+    fn kill_confirm_with_the_right_pid_sets_pending_kill() {
+        let mut app = app_with_agent(4242);
+        app.apply(Action::RequestKillAgent);
+        assert!(matches!(app.overlay, Overlay::Confirm(_)));
+        for c in "4242".chars() {
+            app.apply(Action::InputChar(c));
+        }
+        app.apply(Action::InputSubmit);
+        assert_eq!(app.take_pending_kill().map(|k| k.pid), Some(4242));
+    }
+
+    #[test]
+    fn kill_confirm_rejects_a_wrong_pid() {
+        let mut app = app_with_agent(4242);
+        app.apply(Action::RequestKillAgent);
+        for c in "9999".chars() {
+            app.apply(Action::InputChar(c));
+        }
+        app.apply(Action::InputSubmit);
+        assert!(app.take_pending_kill().is_none());
+        assert!(matches!(app.overlay, Overlay::Confirm(_))); // stays open
     }
 }

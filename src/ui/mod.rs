@@ -9,7 +9,9 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{
+        Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    },
 };
 
 use crate::app::{AppState, Confirm, LiveStatus, Overlay, Palette, Tab, TransitionKind};
@@ -30,7 +32,7 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
     render_header(frame, header, app);
     render_body(frame, body, app);
-    render_footer(frame, footer);
+    render_footer(frame, footer, app);
 
     if app.show_help {
         render_help(frame, frame.area());
@@ -103,13 +105,18 @@ fn render_body(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
     let s = &app.snapshot;
-    let dirty = s
+    let uncommitted = s
         .worktrees
         .iter()
         .filter(|wt| wt.status.as_ref().is_some_and(|st| !st.clean))
         .count();
     let active = (0..s.worktrees.len())
         .filter(|&i| s.processes.worktree_is_active(i))
+        .count();
+    let editing = s
+        .worktrees
+        .iter()
+        .filter(|wt| app.transition_for(&wt.path) == Some(TransitionKind::Activity))
         .count();
     let lines = vec![
         Line::from(vec![
@@ -123,28 +130,60 @@ fn render_overview(frame: &mut Frame, area: Rect, app: &AppState) {
                 .fg(theme::ACCENT),
             Span::from(" worktrees    ").fg(theme::DIM),
             Span::from(active.to_string()).bold().fg(theme::CLEAN),
-            Span::from(" active    ").fg(theme::DIM),
-            Span::from(dirty.to_string()).bold().fg(theme::DIRTY),
-            Span::from(" dirty    ").fg(theme::DIM),
+            Span::from(" with an agent    ").fg(theme::DIM),
+            Span::from(uncommitted.to_string()).bold().fg(theme::DIRTY),
+            Span::from(" uncommitted    ").fg(theme::DIM),
             Span::from(s.collisions.len().to_string())
                 .bold()
                 .fg(theme::COLLISION),
-            Span::from(" collisions    ").fg(theme::DIM),
+            Span::from(" conflict-risk    ").fg(theme::DIM),
             Span::from(s.local_branch_count().to_string()).bold(),
             Span::from(" local    ").fg(theme::DIM),
             Span::from(s.remote_branch_count().to_string()).bold(),
             Span::from(" remote-tracking").fg(theme::DIM),
         ]),
         Line::from(""),
-        Line::from(
-            "Live lanes (active / changing / stale / archive) arrive in later phases."
-                .fg(theme::DIM),
-        ),
+        // Live activity — only as trustworthy as the data is fresh, so it says so.
+        Line::from(vec![
+            Span::from("◆ ").fg(theme::ACTIVITY),
+            Span::from(editing.to_string()).bold().fg(theme::ACTIVITY),
+            Span::from(" editing right now    ").fg(theme::DIM),
+            overview_freshness(app),
+        ]),
     ];
     let p = Paragraph::new(lines)
         .block(Block::bordered().title(" Overview "))
         .wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+/// The Overview freshness line: how live the data is and how long since the last
+/// successful capture — so a "live" summary can never imply fresh data when a
+/// capture has been failing.
+fn overview_freshness(app: &AppState) -> Span<'static> {
+    let ago = app.last_updated.map_or_else(
+        || "not yet".to_string(),
+        |t| {
+            format!(
+                "{} ago",
+                human_dur(crate::storage::events::epoch_secs().saturating_sub(t))
+            )
+        },
+    );
+    if app.stale {
+        return Span::from(format!("⚠ stale — last good capture {ago}"))
+            .bold()
+            .fg(theme::COLLISION);
+    }
+    match app.live {
+        LiveStatus::Live => Span::from(format!("● live · updated {ago}")).fg(theme::CLEAN),
+        LiveStatus::PollOnly => {
+            Span::from(format!("◐ poll-only · updated {ago}")).fg(Color::Yellow)
+        }
+        LiveStatus::Static => {
+            Span::from(format!("○ static · updated {ago} (r to refresh)")).fg(theme::DIM)
+        }
+    }
 }
 
 fn render_worktrees(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -207,58 +246,68 @@ fn worktree_item<'a>(
     transition: Option<TransitionKind>,
     collisions: usize,
 ) -> ListItem<'a> {
-    let mut spans = Vec::new();
-    if let Some(kind) = transition
-        && let Some(marker) = transition_marker(kind)
-    {
-        spans.push(marker);
-    }
-    // The name carries persistent worktree state: yellow while it has
-    // uncommitted work, dim when its status is unknown (a failed `git status`
-    // must read as "unknown", never as clean), normal when known-clean.
-    let mut name = Span::from(wt.display_name()).bold();
-    match wt.status.as_ref() {
-        Some(s) if !s.clean => name = name.fg(theme::DIRTY),
-        None => name = name.fg(theme::DIM),
-        Some(_) => {}
-    }
-    spans.push(name);
+    // Body spans: everything after the leading live-activity dot.
+    let mut body = vec![Span::from(wt.display_name()).bold()];
     if is_current {
-        spans.push(Span::from(" (current)").fg(theme::ACCENT));
+        body.push(Span::from(" (current)").fg(theme::ACCENT));
     }
     if let Some(agent) = agent {
         let name = agent.name.trim_end_matches(".exe");
-        spans.push(Span::from(format!("  ● {name} pid {}", agent.pid)).fg(Color::Green));
+        body.push(Span::from(format!("  ● {name} pid {}", agent.pid)).fg(theme::CLEAN));
     }
     if wt.detached {
-        spans.push(Span::from(" detached").fg(Color::Magenta));
+        body.push(Span::from(" detached").fg(Color::Magenta));
     }
     if wt.locked.is_some() {
-        spans.push(Span::from(" locked").fg(Color::Blue));
+        body.push(Span::from(" locked").fg(Color::Blue));
     }
     if wt.prunable.is_some() {
-        spans.push(Span::from(" prunable").fg(theme::DIM));
+        body.push(Span::from(" prunable").fg(theme::DIM));
     }
     if collisions > 0 {
-        spans.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
+        body.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
     }
-    spans.extend(status_badges(wt.status.as_ref()));
-    // A commit/push milestone briefly recolors the entire row one solid colour.
-    if let Some(color) = milestone_color(transition) {
-        let recolored: Vec<Span> = spans.into_iter().map(|s| s.fg(color)).collect();
+    body.extend(status_badges(wt.status.as_ref()));
+
+    let dot = activity_dot(transition);
+
+    // A commit/push milestone, OR uncommitted state, recolors the ENTIRE row —
+    // dot included — so an actively-edited uncommitted worktree is all yellow
+    // (yellow line, yellow editing dot). Milestone flashes take precedence.
+    let line_color = milestone_color(transition).or_else(|| uncommitted_color(wt.status.as_ref()));
+    if let Some(color) = line_color {
+        let recolored: Vec<Span> = std::iter::once(dot)
+            .chain(body)
+            .map(|s| s.fg(color))
+            .collect();
         return ListItem::new(Line::from(recolored));
     }
+    // Clean: the dot keeps its own live colour (blue ◆ while editing, dim · idle).
+    let mut spans = vec![dot];
+    spans.extend(body);
     ListItem::new(Line::from(spans))
 }
 
-/// A short-lived "flash" glyph for a just-changed worktree. Milestones
-/// (`Committed`/`Pushed`) recolor the whole row instead — see [`milestone_color`].
-fn transition_marker(kind: TransitionKind) -> Option<Span<'static>> {
-    match kind {
-        TransitionKind::Activity => Some(Span::from("◆ ").fg(theme::ACTIVITY)),
-        TransitionKind::Created => Some(Span::from("✚ ").fg(Color::Cyan)),
-        TransitionKind::Deleted => Some(Span::from("⌫ ").fg(theme::COLLISION)),
-        TransitionKind::Committed | TransitionKind::Pushed => None,
+/// The leading live-activity dot for a worktree row, in its own colour: blue ◆
+/// while editing, ✚ created, ⌫ removed, dim · when idle. Milestones recolor the
+/// whole row instead (see [`milestone_color`]), so the dot just dims for those.
+pub(crate) fn activity_dot(transition: Option<TransitionKind>) -> Span<'static> {
+    match transition {
+        Some(TransitionKind::Activity) => Span::from("◆ ").fg(theme::ACTIVITY),
+        Some(TransitionKind::Created) => Span::from("✚ ").fg(Color::Cyan),
+        Some(TransitionKind::Deleted) => Span::from("⌫ ").fg(theme::COLLISION),
+        _ => Span::from("· ").fg(theme::DIM),
+    }
+}
+
+/// The persistent colour the row BODY takes from worktree state: yellow while it
+/// has uncommitted work, dim when its status is unknown (a failed `git status`
+/// must never read as clean), none (standard) when known-clean.
+pub(crate) fn uncommitted_color(status: Option<&WorktreeStatus>) -> Option<Color> {
+    match status {
+        Some(s) if !s.clean => Some(theme::DIRTY),
+        None => Some(theme::DIM),
+        Some(_) => None,
     }
 }
 
@@ -408,8 +457,15 @@ fn render_processes(frame: &mut Frame, area: Rect, app: &AppState) {
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered().title(format!(" Processes ({}) ", procs.len())));
-    frame.render_widget(table, area);
+        .row_highlight_style(Style::new().bold().fg(theme::ACCENT))
+        .highlight_symbol("▸ ")
+        .block(Block::bordered().title(format!(
+            " Processes ({}) — j/k select · K kills selected ",
+            procs.len()
+        )));
+    let mut state = TableState::default();
+    state.select(Some(app.proc_selected.min(procs.len() - 1)));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn label(name: &str) -> Vec<Span<'static>> {
@@ -471,7 +527,7 @@ fn render_timeline(frame: &mut Frame, area: Rect, app: &AppState) {
             frame,
             area,
             "Timeline",
-            "no recorded events yet — created/removed worktrees will appear here.",
+            "no recorded events yet — created/removed worktrees and merge-conflict risks appear here.",
         );
         return;
     }
@@ -484,6 +540,7 @@ fn render_timeline(frame: &mut Frame, area: Rect, app: &AppState) {
             let kind = match ev.kind {
                 EventKind::WorktreeCreated => Span::from("created").fg(Color::Cyan),
                 EventKind::WorktreeRemoved => Span::from("removed").fg(theme::COLLISION),
+                EventKind::ConflictRisk => Span::from("conflict-risk").fg(theme::DIRTY),
             };
             let name = ev.branch.clone().unwrap_or_else(|| ev.path.clone());
             let mut spans = vec![
@@ -513,20 +570,30 @@ fn render_timeline(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn render_collisions(frame: &mut Frame, area: Rect, app: &AppState) {
     let collisions = &app.snapshot.collisions;
-    let no_base = app.snapshot.base.is_none();
+    let base = app.snapshot.base.as_deref();
 
     if collisions.is_empty() {
-        let note = if no_base {
-            "no working-tree collisions. (No base branch like origin/main found, so \
-             committed-but-clean conflicts aren't detected.)"
-        } else {
-            "no changed-file collisions across worktrees — nobody's stepping on each other."
+        let note = match base {
+            None => {
+                "No merge-conflict risk to forecast: no base branch (origin/main, main, …) \
+                     was found, so cross-branch overlap can't be compared."
+            }
+            Some(_) => {
+                "No merge-conflict risk — no file has been changed on two worktrees, so \
+                        nothing should conflict when these branches merge back."
+            }
         };
-        render_placeholder(frame, area, "Collisions", note);
+        render_placeholder(frame, area, "Merge Conflict Risk", note);
         return;
     }
 
-    let mut items: Vec<ListItem> = Vec::new();
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(
+        Span::from(format!(
+            "Files changed on 2+ worktrees — likely to conflict when merged{}:",
+            base.map_or_else(String::new, |b| format!(" into {b}"))
+        ))
+        .fg(theme::DIM),
+    ))];
     let mut last_severity: Option<Severity> = None;
     for collision in collisions {
         if last_severity != Some(collision.severity) {
@@ -537,28 +604,33 @@ fn render_collisions(frame: &mut Frame, area: Rect, app: &AppState) {
             )));
             last_severity = Some(collision.severity);
         }
-        let names: Vec<String> = collision
+        // Each involved worktree, annotated with its agent (if one is attached),
+        // joined by × to read as "these two will collide at merge".
+        let who: Vec<String> = collision
             .worktrees
             .iter()
             .map(|&i| {
-                app.worktrees()
+                let name = app
+                    .worktrees()
                     .get(i)
-                    .map_or_else(|| format!("(worktree #{i})"), WorktreeRecord::display_name)
+                    .map_or_else(|| format!("#{i}"), WorktreeRecord::display_name);
+                match app.snapshot.processes.agent_for_worktree(i) {
+                    Some(a) => format!("{name} [{}]", a.name.trim_end_matches(".exe")),
+                    None => name,
+                }
             })
             .collect();
         items.push(ListItem::new(Line::from(vec![
             Span::from(format!("  {}", collision.file)).bold(),
-            Span::from(format!("   {}", names.join(", "))).fg(theme::DIM),
+            Span::from(format!("   {}", who.join("  ×  "))).fg(theme::DIM),
         ])));
     }
 
-    let base_note = if no_base {
-        " · base: none — committed-conflict detection inactive"
-    } else {
-        ""
-    };
-    let list = List::new(items)
-        .block(Block::bordered().title(format!(" Collisions ({}){base_note} ", collisions.len())));
+    let base_label = base.map_or_else(|| " · no base".to_string(), |b| format!(" vs {b}"));
+    let list = List::new(items).block(Block::bordered().title(format!(
+        " Merge Conflict Risk ({}){base_label} ",
+        collisions.len()
+    )));
     frame.render_widget(list, area);
 }
 
@@ -606,10 +678,9 @@ fn render_cleanup(frame: &mut Frame, area: Rect, app: &AppState) {
         })
         .collect();
 
-    let list =
-        List::new(items).block(Block::bordered().title(
-            " Cleanup — ✓ safe · ! caution/dirty · ✗ active   (select in Worktrees, then x) ",
-        ));
+    let list = List::new(items).block(Block::bordered().title(
+        " Cleanup — ✓ safe · ! caution/uncommitted · ✗ active   (select in Worktrees, then x) ",
+    ));
     frame.render_widget(list, area);
 }
 
@@ -696,7 +767,19 @@ fn render_placeholder(frame: &mut Frame, area: Rect, title: &str, note: &str) {
     frame.render_widget(body, area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn render_footer(frame: &mut Frame, area: Rect, app: &AppState) {
+    // A transient action result (e.g. a kill outcome) takes over the footer so a
+    // requested destructive action is always acknowledged on screen.
+    if let Some((text, is_error)) = app.status() {
+        let color = if is_error {
+            theme::COLLISION
+        } else {
+            theme::CLEAN
+        };
+        let line = Line::from(Span::from(format!(" {text}")).bold().fg(color));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let hints = Line::from(vec![
         Span::from(" q ").bold(),
         Span::from("quit  ").fg(theme::DIM),
@@ -714,6 +797,8 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::from("cmd  ").fg(theme::DIM),
         Span::from("x ").bold(),
         Span::from("remove  ").fg(theme::DIM),
+        Span::from("K ").bold(),
+        Span::from("kill  ").fg(theme::DIM),
         Span::from("1-7 ").bold(),
         Span::from("jump  ").fg(theme::DIM),
         Span::from("? ").bold(),
@@ -737,6 +822,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  /          search / filter worktrees"),
         Line::from("  :          command palette"),
         Line::from("  x          remove selected worktree (type-to-confirm)"),
+        Line::from("  K          kill attached agent / selected process (confirm)"),
         Line::from("  p          prune stale worktree metadata"),
         Line::from("  1 – 7      jump to a tab"),
         Line::from(""),
@@ -834,12 +920,13 @@ mod render_tests {
     }
 
     #[test]
-    fn activity_renders_a_blue_marker() {
-        let mut app = app_on_worktrees(vec![wt("/repo", false)]);
+    fn activity_on_a_clean_worktree_shows_a_blue_dot() {
+        // Clean + editing (the brief window before git sees the change) → blue ◆.
+        let mut app = app_on_worktrees(vec![wt("/repo", true)]);
         app.note_activity(&[std::path::PathBuf::from("/repo/src/x.rs")]);
         let buf = render_buffer(&app);
-        assert!(has_symbol(&buf, "◆"), "expected the blue activity marker");
-        assert!(has_fg(&buf, theme::ACTIVITY));
+        assert!(has_symbol(&buf, "◆"), "expected the editing dot");
+        assert!(has_fg(&buf, theme::ACTIVITY), "blue while clean");
     }
 
     #[test]
@@ -857,5 +944,31 @@ mod render_tests {
         let mut app = app_on_worktrees(vec![wt("/repo", false)]);
         app.transitions.note("/repo".into(), TransitionKind::Pushed);
         assert!(has_fg(&render_buffer(&app), theme::CLEAN));
+    }
+
+    #[test]
+    fn every_tab_renders_without_panicking() {
+        let mut app = app_on_worktrees(vec![wt("/repo", false)]);
+        app.set_status("✓ terminated foo (pid 1)".into(), false);
+        app.transitions
+            .note("/repo".into(), TransitionKind::Committed);
+        for tab in Tab::ALL {
+            app.active_tab = tab;
+            let _ = render_buffer(&app); // every tab must render, not panic
+        }
+    }
+
+    #[test]
+    fn editing_an_uncommitted_worktree_is_all_yellow() {
+        // Yellow line AND a yellow editing dot — no blue once uncommitted.
+        let mut app = app_on_worktrees(vec![wt("/repo", false)]);
+        app.note_activity(&[std::path::PathBuf::from("/repo/src/x.rs")]);
+        let buf = render_buffer(&app);
+        assert!(has_symbol(&buf, "◆"), "editing dot present");
+        assert!(has_fg(&buf, theme::DIRTY), "all yellow");
+        assert!(
+            !has_fg(&buf, theme::ACTIVITY),
+            "dot is not blue when uncommitted"
+        );
     }
 }

@@ -8,6 +8,50 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-09
+
+A live-activity and agent-control release: a refined per-worktree visual language, the ability
+to terminate forgotten/stuck agent processes, an honest agent classifier, and the collisions
+view reframed as merge-conflict risk.
+
+### Added
+- **Kill a process — on request, never automatically.** `K` on the Worktrees tab terminates the
+  agent attached to the selected worktree; the Processes tab is now selectable (`j`/`k`) with `K`
+  to terminate any mapped process. Both behind a type-the-PID confirm showing `pid · name · cwd`,
+  with a PID-reuse guard (`process::scanner::kill` re-verifies the executable name before
+  signalling) and an on-screen result in the footer (`✓ terminated …` / `⚠ kill failed: …`).
+  wb300 refuses to terminate itself and never lists its own process.
+- **Live save activity** now plays as an ordered flash *sequence*: a back-to-back commit+push
+  shows magenta then green (`app::transitions` is now a timed sequence with per-kind TTLs and a
+  priority guard; `change_kind` returns an ordered `Vec<TransitionKind>`).
+- **Overview live summary + freshness:** replaces the old placeholder with `◆ N editing right
+  now` plus a freshness line (`● live · updated Ns ago` / `◐ poll-only` / `○ static` / `⚠ stale
+  — last good capture Ns ago`), driven by a new `AppState::last_updated`.
+- **Merge-conflict-risk log:** a new `EventKind::ConflictRisk` archives each newly-appearing
+  cross-worktree file overlap (keyed by file + worktree set) to the Timeline.
+
+### Changed
+- **Per-worktree visuals:** a leading live dot (blue `◆` while editing a clean tree) plus the
+  whole row recolored by state — **whole-line yellow while uncommitted** (dot included), a
+  **magenta** commit / **green** push milestone flash over the whole row (precedence over
+  yellow), and **dim** when a worktree's status is unknown. Worktree-list selection no longer
+  overrides the row foreground, so flashes stay visible on the selected row.
+- **Collisions → "Merge Risk".** The tab is renamed and the panel reframed as a merge forecast:
+  *files changed on 2+ worktrees, likely to conflict when merged into `<base>`*, annotated with
+  each worktree's agent. (Cross-worktree overlap is merge-conflict risk, not a live collision —
+  worktrees are isolated copies.)
+- **Honest agent classifier:** Claude *Desktop* (the Electron GUI app and its
+  gpu/renderer/crashpad helpers) is no longer mistaken for a coding agent
+  (`process::classifier` excludes `--type=` helpers and the packaged app path); real agent CLIs
+  (`.local/bin/claude.exe`, `…/claude-code/<ver>/claude.exe`, `claude-agent-sdk`) still count.
+- **Terminology:** user-facing "dirty" is now "uncommitted" throughout.
+- Removed worktrees on a `main`/`master` branch are now protected from removal alongside the
+  primary checkout, current worktree, and bare repos (`AppState::is_protected`).
+
+### Fixed
+- Per-worktree status failures already logged (v1.1.0) are reinforced by a dim "unknown" row
+  affordance so an unreadable `git status` never renders as clean.
+
 ## [1.1.0] - 2026-06-08
 
 Live activity signals on the lowest-level node (the worktree), so an operator watching a swarm

@@ -8,5 +8,5 @@ pub mod classifier;
 pub mod scanner;
 pub mod types;
 
-pub use scanner::{scan, scan_agent_cwds};
+pub use scanner::{kill, scan, scan_agent_cwds};
 pub use types::{ProcessInfo, ProcessLabel, ProcessSnapshot};

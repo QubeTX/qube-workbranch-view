@@ -7,7 +7,7 @@ use ratatui::style::Color;
 pub const ACCENT: Color = Color::Cyan;
 /// De-emphasized text (hints, secondary labels).
 pub const DIM: Color = Color::DarkGray;
-/// Dirty / modified state.
+/// Uncommitted / modified state.
 pub const DIRTY: Color = Color::Yellow;
 /// Collision / conflict state.
 pub const COLLISION: Color = Color::Red;

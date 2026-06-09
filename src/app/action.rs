@@ -38,6 +38,14 @@ pub enum Action {
     RequestRemove,
     /// Prune stale worktree metadata.
     RequestPrune,
+    /// Request killing the agent attached to the selected worktree (confirm).
+    RequestKillAgent,
+    /// Request killing the selected process in the Processes tab (confirm).
+    RequestKillProcess,
+    /// Move the selection down within the Processes list.
+    ProcessDown,
+    /// Move the selection up within the Processes list.
+    ProcessUp,
     /// Type a character into the active overlay.
     InputChar(char),
     /// Delete the last character in the active overlay.

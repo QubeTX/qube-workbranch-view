@@ -160,14 +160,14 @@ impl HomeState {
             .map(|r| (repo_key(r), r))
             .collect();
 
-        let mut notes: Vec<(String, TransitionKind)> = Vec::new();
+        let mut notes: Vec<(String, Vec<TransitionKind>)> = Vec::new();
         for new_repo in &new.repos {
             if let Some(old_repo) = old_by_key.get(&repo_key(new_repo)) {
                 collect_repo_transitions(old_repo, new_repo, &mut notes);
             }
         }
-        for (path, kind) in notes {
-            self.transitions.note(path, kind);
+        for (path, seq) in notes {
+            self.transitions.note_seq(path, seq);
         }
 
         self.snapshot = new;
@@ -189,7 +189,7 @@ impl HomeState {
 fn collect_repo_transitions(
     old: &RepoSnapshot,
     new: &RepoSnapshot,
-    notes: &mut Vec<(String, TransitionKind)>,
+    notes: &mut Vec<(String, Vec<TransitionKind>)>,
 ) {
     let previous: HashMap<&str, &WorktreeRecord> = old
         .worktrees
@@ -199,10 +199,11 @@ fn collect_repo_transitions(
 
     for wt in &new.worktrees {
         match previous.get(wt.path.as_str()) {
-            None => notes.push((wt.path.clone(), TransitionKind::Created)),
+            None => notes.push((wt.path.clone(), vec![TransitionKind::Created])),
             Some(old_wt) => {
-                if let Some(kind) = change_kind(old_wt, wt) {
-                    notes.push((wt.path.clone(), kind));
+                let kinds = change_kind(old_wt, wt);
+                if !kinds.is_empty() {
+                    notes.push((wt.path.clone(), kinds));
                 }
             }
         }
@@ -211,7 +212,7 @@ fn collect_repo_transitions(
     let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
     for old_wt in &old.worktrees {
         if !old_wt.bare && !incoming.contains(old_wt.path.as_str()) {
-            notes.push((old_wt.path.clone(), TransitionKind::Deleted));
+            notes.push((old_wt.path.clone(), vec![TransitionKind::Deleted]));
         }
     }
 }

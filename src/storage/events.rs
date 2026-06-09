@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum EventKind {
     WorktreeCreated,
     WorktreeRemoved,
+    /// A file became changed on a 2nd worktree — a new merge-conflict risk.
+    ConflictRisk,
 }
 
 impl EventKind {
@@ -17,6 +19,7 @@ impl EventKind {
         match self {
             EventKind::WorktreeCreated => "created",
             EventKind::WorktreeRemoved => "removed",
+            EventKind::ConflictRisk => "conflict-risk",
         }
     }
 }

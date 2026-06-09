@@ -5,6 +5,31 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 
 ## Unreleased
 
+## Shut down a runaway agent, and a clearer live picture
+
+This release is about seeing the truth and acting on it:
+
+- **You can now shut down a forgotten or stuck agent with a keystroke.** Select a worktree and
+  press a key, confirm by typing the process number, and WB-300 ends that agent's process. You
+  can also do it from the process list for any program. It always asks first, shows you exactly
+  what you're about to close (name, number, folder), refuses to close itself, and tells you on
+  screen whether it worked or why it didn't. WB-300 never closes anything on its own — only when
+  you ask.
+- **WB-300 stopped mistaking the Claude desktop app for a working agent.** It now only counts the
+  real coding-agent programs, so "which branches actually have an agent on them" is trustworthy.
+- **The board reads more clearly.** A worktree's whole line turns yellow the entire time it has
+  unsaved-to-history changes; a small dot shows the file being written right now; the row flashes
+  magenta the moment it commits and green the moment it pushes (and if you commit and push
+  back-to-back, it flashes magenta then green). The home screen overview now tells you how many
+  worktrees are being edited right now and how fresh the information is — and warns you plainly if
+  it ever can't read the latest, instead of pretending everything's current.
+- **"Collisions" is now "Merge Risk"** and says what it really means: which files have been
+  changed on more than one branch and will likely clash when those branches are merged back
+  together — with the agent on each side shown. (Two agents editing the same-named file in two
+  separate worktrees aren't actually fighting — each has its own copy — but they will conflict at
+  merge time, and that's what this now forecasts.) New conflicts are also recorded to the history.
+- We made sure you can never accidentally remove your main worktree.
+
 ## Watch your agents work, live
 
 WB-300 now shows you what's happening across your worktrees as it happens, so you can glance at

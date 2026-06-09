@@ -1,12 +1,13 @@
 //! Transient UI highlights ("flashes") for live changes (handoff §12.9).
 //!
-//! Persistent state (dirty, collision) lives on the snapshot; these are the
-//! short-lived overlays. Two visual tiers:
+//! Persistent state (uncommitted, collision) lives on the snapshot; these are
+//! the short-lived overlays. Two visual tiers:
 //!
 //! - `Activity` — a frequent, short-lived *save* pulse: a blue marker that
 //!   tracks the file being written and goes dark within ~½s of saves stopping.
 //! - `Committed`/`Pushed` — milestone flashes that briefly recolor the whole
-//!   row (magenta on commit, green on push).
+//!   row (magenta on commit, green on push). A back-to-back commit+push plays
+//!   them as an ordered **sequence**: magenta, then green.
 //! - `Created`/`Deleted` — a worktree appearing / disappearing.
 
 use std::collections::HashMap;
@@ -27,8 +28,8 @@ pub enum TransitionKind {
 impl TransitionKind {
     /// How long this kind's highlight stays visible. `Activity` is deliberately
     /// short so the blue marker tracks live save state (dark ~½s after saves
-    /// stop and "hops" to whichever worktree is being written); milestones flash
-    /// "a second or two"; structural create/remove linger so they're not missed.
+    /// stop); milestones flash "a second or two"; structural create/remove
+    /// linger so they're not missed.
     fn ttl(self) -> Duration {
         match self {
             TransitionKind::Activity => Duration::from_millis(600),
@@ -38,7 +39,7 @@ impl TransitionKind {
     }
 
     /// Relative signal strength. A lower-priority flash must not clobber a
-    /// higher-priority one that's still on screen (a constant `Activity` pulse
+    /// higher-priority one that's still on screen (the constant `Activity` pulse
     /// must never hide a `Committed`/`Pushed` milestone).
     fn priority(self) -> u8 {
         match self {
@@ -49,58 +50,83 @@ impl TransitionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// One highlight: an ordered sequence of kinds played back-to-back from
+/// `started`, each for its own [`TransitionKind::ttl`]. A single change is a
+/// one-element sequence; a commit+push is `[Committed, Pushed]`.
+#[derive(Debug, Clone)]
 struct Transition {
-    kind: TransitionKind,
+    seq: Vec<TransitionKind>,
     started: Instant,
-    ttl: Duration,
 }
 
-/// Time-limited highlights keyed by worktree path. Each entry expires on its
-/// own per-kind TTL (see [`TransitionKind::ttl`]).
+impl Transition {
+    /// The kind active `elapsed` into the sequence, if any (pure — testable).
+    fn active_at(&self, elapsed: Duration) -> Option<TransitionKind> {
+        let mut remaining = elapsed;
+        for &kind in &self.seq {
+            if remaining < kind.ttl() {
+                return Some(kind);
+            }
+            remaining = remaining.saturating_sub(kind.ttl());
+        }
+        None
+    }
+
+    /// The kind active right now, if the sequence hasn't finished.
+    fn active(&self) -> Option<TransitionKind> {
+        self.active_at(self.started.elapsed())
+    }
+}
+
+/// Time-limited highlights keyed by worktree path.
 #[derive(Debug, Default)]
 pub struct Transitions {
     map: HashMap<String, Transition>,
 }
 
 impl Transitions {
-    /// Record (or refresh) a highlight for `key`. A lower-priority kind is
-    /// dropped if a higher-priority highlight is still active for the same key,
-    /// so the frequent `Activity` pulse never stomps a live milestone flash.
+    /// Record (or refresh) a single-kind highlight for `key`.
     pub fn note(&mut self, key: String, kind: TransitionKind) {
+        self.note_seq(key, vec![kind]);
+    }
+
+    /// Record an ordered sequence of highlights for `key` (e.g. commit→push).
+    /// A lower-priority sequence is dropped if a higher-priority highlight is
+    /// still active for the same key, so the frequent `Activity` pulse never
+    /// stomps a live milestone flash.
+    pub fn note_seq(&mut self, key: String, seq: Vec<TransitionKind>) {
+        let Some(&first) = seq.first() else {
+            return;
+        };
         if let Some(existing) = self.map.get(&key)
-            && existing.started.elapsed() < existing.ttl
-            && existing.kind.priority() > kind.priority()
+            && let Some(active) = existing.active()
+            && active.priority() > first.priority()
         {
             return;
         }
         self.map.insert(
             key,
             Transition {
-                kind,
+                seq,
                 started: Instant::now(),
-                ttl: kind.ttl(),
             },
         );
     }
 
     /// The active (un-expired) highlight for `key`, if any.
     pub fn get(&self, key: &str) -> Option<TransitionKind> {
-        self.map
-            .get(key)
-            .filter(|t| t.started.elapsed() < t.ttl)
-            .map(|t| t.kind)
+        self.map.get(key).and_then(Transition::active)
     }
 
-    /// Drop expired highlights.
+    /// Drop finished highlights.
     pub fn expire(&mut self) {
-        self.map.retain(|_, t| t.started.elapsed() < t.ttl);
+        self.map.retain(|_, t| t.active().is_some());
     }
 
     /// Whether any highlight is currently active (used to decide if the UI needs
     /// to keep animating).
     pub fn any_active(&self) -> bool {
-        self.map.values().any(|t| t.started.elapsed() < t.ttl)
+        self.map.values().any(|t| t.active().is_some())
     }
 }
 
@@ -133,17 +159,31 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_milestone_wins_over_an_equal_one() {
-        let mut t = Transitions::default();
-        t.note("/w".into(), TransitionKind::Committed);
-        t.note("/w".into(), TransitionKind::Pushed); // equal priority, newest shows
-        assert_eq!(t.get("/w"), Some(TransitionKind::Pushed));
-    }
-
-    #[test]
     fn unknown_key_has_no_highlight() {
         let t = Transitions::default();
         assert_eq!(t.get("/nope"), None);
         assert!(!t.any_active());
+    }
+
+    #[test]
+    fn a_sequence_plays_committed_then_pushed_then_clears() {
+        let seq = vec![TransitionKind::Committed, TransitionKind::Pushed];
+        let trans = Transition {
+            seq: seq.clone(),
+            started: Instant::now(),
+        };
+        // Start of the window → magenta (committed).
+        assert_eq!(
+            trans.active_at(Duration::ZERO),
+            Some(TransitionKind::Committed)
+        );
+        // Just into the second window → green (pushed).
+        let into_push = TransitionKind::Committed.ttl() + Duration::from_millis(1);
+        assert_eq!(trans.active_at(into_push), Some(TransitionKind::Pushed));
+        // Past both windows → cleared.
+        let past_all = TransitionKind::Committed.ttl()
+            + TransitionKind::Pushed.ttl()
+            + Duration::from_millis(1);
+        assert_eq!(trans.active_at(past_all), None);
     }
 }

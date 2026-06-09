@@ -28,18 +28,24 @@ Ratatui is the cockpit.            ← fast, flicker-free, runs anywhere a termi
 
 ## What it does
 
-- **Sees every agent.** It scans the OS process table, figures out which worktree each process
-  is living in, and labels it — Claude/Codex agents, builds, test runs, shells, editors — with
-  CPU, memory, and uptime. A green `● claude pid 1234` sits right on the worktree it's in.
-- **Updates itself, live.** Save a file and a blue mark pulses on that worktree while it's being
-  written; its name stays *yellow* the whole time it has uncommitted work; commit and the whole
-  row flashes *magenta*, push and it flashes *green* — then it settles back. Another terminal
-  creates or deletes a worktree and it notices and records it. No refresh key required (though
-  `r` is there if you want it). If it ever can't read Git, the header says **stale** rather than
-  leaving old data looking live.
-- **Warns you before the merge hell.** It compares what every worktree has touched — including
-  commits made since the shared base — and flags any file two or more worktrees have changed,
-  color-coded by how scary the path is (lockfiles, migrations, and CI configs are the scariest).
+- **Sees every agent — the real ones.** It scans the OS process table, figures out which worktree
+  each process is living in, and labels it — Claude/Codex agents, builds, test runs, shells,
+  editors — with CPU, memory, and uptime. A green `● claude pid 1234` sits right on the worktree
+  it's in. It tells a real coding-agent CLI apart from the Claude *desktop* app, so "which
+  branches have an agent" stays trustworthy. Found a forgotten or stuck agent? `K` ends it,
+  behind a type-the-PID confirm (wb300 never kills anything on its own).
+- **Updates itself, live.** Save a file and a dot marks the worktree being written; its whole
+  line stays *yellow* the entire time it has uncommitted work; commit and the row flashes
+  *magenta*, push and it flashes *green* (commit-then-push back to back flashes magenta *then*
+  green), then it settles back. Another terminal creates or deletes a worktree and it notices and
+  records it. No refresh key required (though `r` is there if you want it). The Overview tells you
+  how many worktrees are being edited right now and how fresh the data is — and says **stale**
+  plainly if it ever can't read Git, rather than leaving old data looking live.
+- **Forecasts the merge hell.** Worktrees are isolated copies, so two agents editing the same
+  file in two worktrees aren't fighting *now* — but they'll clash when those branches merge back.
+  The **Merge Risk** view flags every file changed on two or more worktrees, names the agent on
+  each side, and color-codes by how scary the path is (lockfiles, migrations, and CI configs are
+  the scariest). New risks are recorded to the timeline as they appear.
 - **Cleans up — safely.** It scores each worktree (safe / caution / dirty / active / protected)
   and lets you remove one behind a **type-the-name-to-confirm** dialog. Dirty work gets a rescue
   patch saved *first*, and if that rescue can't be written, the delete is **aborted**. It will
@@ -73,8 +79,10 @@ it fast and safe to leave running on a busy machine:
   snapshot is canonical and everything on screen is derived from it. Easy to reason about, easy
   to test — it ships with a real unit + integration suite that runs Git against throwaway repos.
 
-And it's **safe by default**: it never fetches, pushes, rebases, resets, or kills a process on
-its own. The only network call it makes is one you ask for (`f` to fetch) or `wb300 update`.
+And it's **safe by default**: it never fetches, pushes, rebases, resets, or kills anything on its
+own — every mutation is an explicit, confirmed keystroke (`f` fetch, `x` remove a worktree, `K`
+kill an agent), and it won't terminate its own process. The only network call it makes is one you
+ask for (`f` to fetch) or `wb300 update`.
 
 ## Installation
 
@@ -158,7 +166,7 @@ q / Esc   quit / close overlay      Tab / Shift+Tab   next / previous tab
 j / k     move selection            r                 refresh snapshot
 /         filter worktrees          f                 fetch from remotes (never automatic)
 :         command palette           x                 remove selected worktree (type-to-confirm)
-                                     p                 prune stale worktree metadata (confirm)
+K         kill agent / process      p                 prune stale worktree metadata (confirm)
 ```
 
 (The full, configurable keybinding set lands with the config subsystem.)
