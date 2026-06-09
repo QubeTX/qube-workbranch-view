@@ -8,6 +8,47 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-08
+
+Live activity signals on the lowest-level node (the worktree), so an operator watching a swarm
+of agents can see what's being written, what's uncommitted, and what just shipped — at a glance.
+
+### Added
+- **Live save marker.** A blue `◆` flashes on a worktree row while files are being created /
+  modified / deleted inside it, with a short save-driven TTL (~0.6s) so it tracks the file being
+  written and goes dark within ~½s of saves stopping. Driven by a new immediate (un-debounced)
+  activity lane: `live/fs_watcher.rs` now forwards the changed `Vec<PathBuf>` and
+  `live/debouncer.rs` splits it into a lossy activity lane (`AppState::note_activity` /
+  `HomeState::note_activity` → `note_activity_for`, mapping each path to its worktree via
+  `util::paths::longest_prefix_match`) plus the existing coalesced refresh. Works in both the
+  per-repo and `--home` views.
+- **Persistent uncommitted highlight.** A worktree's name is held yellow the whole time it has
+  uncommitted changes (`ui/mod.rs`, `ui/home.rs`); an *unknown* status (a failed `git status`)
+  renders dim, never as clean.
+- **Commit / push milestone flashes.** The whole row briefly recolors (~1.8s) — magenta on a
+  commit (HEAD moved, new `TransitionKind::Committed` in `app::state::change_kind`), green on a
+  push — then settles back. New `theme::ACTIVITY` (blue) and `theme::COMMITTED` (magenta).
+- Per-entry TTLs and a priority guard on `Transitions` so the frequent activity pulse never
+  stomps a live milestone/structural flash (`app/transitions.rs`).
+- Render-buffer tests (ratatui `TestBackend`) asserting the painted colors for the dirty-yellow
+  name, the blue activity marker, and the magenta/green milestone recolors.
+
+### Changed
+- Worktree-list selection is now marked by bold + the `▸ ` cursor only (no foreground override),
+  so live flashes and the uncommitted-yellow name stay visible on the *selected* row too
+  (`ui/mod.rs`).
+- Unified the "pushed" color across views to green (the home view previously used cyan).
+- Removed the old git-status-delta "modified" flash (`TransitionKind::Modified`); it is
+  superseded by the blue activity marker (transient) plus the persistent uncommitted-yellow name.
+
+### Fixed
+- A failed `RepoSnapshot::capture` no longer silently shows stale data: it is logged and a
+  `⚠ stale` flag is surfaced in the header so "● live" can't imply fresh data when it isn't
+  (`lib.rs`, `app/state.rs`, `ui/mod.rs`).
+- Per-worktree `git status` failures are logged instead of being silently dropped and read as
+  "clean" (`git/snapshot.rs`); the home view logs a repo whose capture fails rather than letting
+  it vanish silently (`home/snapshot.rs`).
+
 ## [1.0.0] - 2026-06-08
 
 First public release. Everything below shipped in `v1.0.0`.
