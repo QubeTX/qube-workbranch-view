@@ -96,3 +96,27 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 - Review fixes (data-loss focus): a failed rescue snapshot now **aborts** the removal (never
   force-delete unrescued work); prune requires confirmation; the confirm token is typeable for
   detached/unknown worktrees (branch → short oid → `REMOVE`).
+- Full Windows distribution (parity with TR-300): four first-class installers — Global MSI
+  (`wix/main.wxs`, cargo-dist-built), Corporate MSI (`wix-corporate/corporate.wxs`), Global EXE
+  (`inno/global.iss`), Corporate EXE (`inno/corporate.iss`) — with permanent product GUIDs,
+  per-edition install paths (`%ProgramFiles%\wb300\bin` / `%LocalAppData%\Programs\wb300\bin`),
+  PATH management (system vs user), and `HKCU\Software\WB300\InstallSource` markers
+  (`msi-global` / `msi-corporate` / `exe-global` / `exe-corporate`).
+- `.github/workflows/windows-installers.yml`: hand-authored, chains off `release.yml` via
+  `workflow_run` (the GITHUB_TOKEN-suppression-safe trigger) plus `workflow_dispatch`; verifies
+  the upstream cargo-dist release is complete (probes `dist-manifest.json` + the Global MSI),
+  builds the Corporate MSI via bare `candle`/`light` (`-sice:ICE38/64/91`) and the two EXEs via
+  Inno Setup 6, writes `.sha256` sidecars, and `gh release upload --clobber`s the 6 add-on
+  assets.
+- Registry-aware self-update (`src/update.rs`, wiring `wb300 update` + `update --json`): queries
+  the GitHub releases API, compares semver (prerelease/build-metadata aware), and dispatches to
+  an install-origin-matched strategy. On Windows it reads the `InstallSource` marker (path-based
+  fallback for cargo/PowerShell installs), downloads the matching MSI/EXE, **verifies its
+  SHA-256 against the published sidecar before running it**, and confirms the post-install
+  `--version`; elsewhere it prefers `cargo install` (with a crates.io-lag re-verify) then the
+  shell installer. New deps: `ureq`; `winreg` + `sha2` (Windows only). 31 unit tests.
+- `deploy.sh`: one-command release wrapper scripting the CLAUDE.md runbook in two PR-gated
+  phases — `bump <patch|minor|major|X.Y.Z>` (version bump + lockstep-changelog guard + local
+  gates + scoped commit + branch push) and `tag` (clean-tree / on-main / CI-green / no-retag
+  checks, then push the `vX.Y.Z` tag). README install matrix (6 channels) and the CLAUDE.md
+  deploy runbook + lockstep contract updated to match.

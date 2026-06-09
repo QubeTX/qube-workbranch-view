@@ -1,0 +1,153 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Copyright (C) 2017 Christopher R. Field.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+
+<!--
+  WB-300 Global Edition (perMachine MSI), built by cargo-dist via cargo-wix
+  during release.yml. The product GUIDs below are PERMANENT — regenerating
+  them breaks in-place upgrades. UpgradeCode + the PATH component Guid match
+  the [package.metadata.wix] upgrade-guid / path-guid in Cargo.toml so the
+  hand-authored template stays consistent with cargo-wix's generated form.
+
+  cargo-wix predefined variables (set at installer build time):
+    CargoTargetBinDir = directory containing wb300.exe (e.g. target\release)
+    Version           = Major.Minor.Fix from the Rust package version.
+-->
+
+<!--
+  Please do not remove these pre-processor If-Else blocks. These are used with
+  the `cargo wix` subcommand to automatically determine the installation
+  destination for 32-bit versus 64-bit installers. Removal of these lines will
+  cause installation errors.
+-->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='wb300'
+        UpgradeCode='8BA6E6D1-7F65-4CD1-B8C3-B4C03BFC6526'
+        Manufacturer='Emmett S'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Live TUI control tower for Git worktrees used by parallel coding agents'
+            Manufacturer='Emmett S'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='wb300 Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='wb300'>
+
+                    <!-- Install-source marker. `wb300 update` reads this from
+                         HKCU and picks the matching installer to download for
+                         in-place upgrades. HKCU even on a perMachine install:
+                         the user running this MSI is the user who'll later
+                         invoke `wb300 update`. The path-based fallback in
+                         src/update.rs::detect_install_origin() catches the rare
+                         "admin pushed via Intune, end-user is different" case.
+                         Value must match the `msi-global` arm in src/update.rs.
+                         See wix-corporate/corporate.wxs for the perUser sibling. -->
+                    <Component Id='InstallSourceMarker' Guid='60516A1C-F534-442D-8F5F-0BBD58F87456'>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\WB300'
+                            Name='InstallSource'
+                            Type='string'
+                            Value='msi-global'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='97091D9A-5D6E-4471-8C72-311B0999197F' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='wb300.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\wb300.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs the wb300 binary.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='InstallSourceMarker'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location of the [ProductName] executable to the PATH system environment variable. This allows the [ProductName] executable to be called from any location.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/QubeTX/qube-workbranch-view'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

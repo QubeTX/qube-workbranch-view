@@ -52,3 +52,15 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
   command menu, and x to remove the selected worktree — but only after you type its name to
   confirm. If it has uncommitted changes, WB-300 saves a rescue copy first, and it will NOT
   delete anything if saving that rescue fails. Cleaning up leftover bookkeeping also asks first.
+- WB-300 now installs the same way everywhere the rest of the toolkit does. On Mac and Linux
+  there's a one-line installer; on Windows there are four ready-to-run installers — a regular
+  one that needs admin and a "corporate" one that installs just for you with no admin rights,
+  each available as a classic MSI or a setup EXE. You can also get it from Cargo or build it
+  from source. Pick whichever fits your machine.
+- `wb300 update` now upgrades WB-300 in place. On Windows it remembers how you installed it and
+  fetches the matching installer, checks the download is genuine before running it, and confirms
+  the new version actually took — so the no-admin "corporate" install upgrades without ever
+  asking for admin. Add `--json` if a script or agent needs to read the result.
+- Releasing a new version is now a single command for maintainers, split into a safe
+  "prepare" step and a "ship" step, with built-in guards so a release can't go out with mismatched
+  notes or before its checks pass.

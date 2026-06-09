@@ -1,0 +1,169 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Copyright (C) 2017 Christopher R. Field.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+
+<!--
+  WB-300 Corporate Edition (perUser MSI).
+
+  This template ships alongside `wix/main.wxs` (the Global / perMachine MSI).
+  Built by `.github/workflows/windows-installers.yml` after `release.yml`
+  finishes publishing the GitHub Release, then uploaded as
+  `wb300-x86_64-pc-windows-msvc-corporate.msi`.
+
+  Differences vs main.wxs (intentional — do not converge):
+    - InstallScope="perUser" on the Package element. Sufficient on WiX 3.11+
+        to install without UAC on machines where the user has no admin rights
+        but still has write access to %LocalAppData%. Do NOT also set
+        ALLUSERS="" as a Property — WiX 3.11 candle rejects an empty-string
+        Value with CNDL0006; InstallScope="perUser" alone is equivalent.
+    - UpgradeCode is a DIFFERENT GUID from the Global edition. Same UpgradeCode
+        across editions would confuse Windows Installer and break upgrades in
+        both directions. A user can have both editions installed at once
+        (Add/Remove Programs shows two entries); PATH order decides which
+        `wb300` wins.
+    - Install location: %LocalAppData%\Programs\wb300\bin\wb300.exe
+        instead of %ProgramFiles%\wb300\bin\wb300.exe.
+    - PATH entry: user PATH (HKCU\Environment\Path) instead of
+        system PATH (HKLM\...\Session Manager\Environment\Path).
+    - Product Name: "wb300 (Corporate Edition)" — distinct ARP entry.
+
+  All product GUIDs here are PERMANENT. If install paths in this file change,
+  update `src/update.rs::detect_install_origin()` in lockstep — that function
+  matches on the install path (and registry marker) to choose which MSI to
+  fetch during `wb300 update`.
+
+  cargo-wix predefined variables (set at build time):
+    CargoTargetBinDir = directory containing wb300.exe (e.g. target\release)
+    Version           = Major.Minor.Fix from the Rust package version.
+-->
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='wb300 (Corporate Edition)'
+        UpgradeCode='D65D3D9D-39ED-4574-91DF-6DE375D83F1D'
+        Manufacturer='Emmett S'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Live TUI control tower for Git worktrees (Corporate Edition, per-user install)'
+            Manufacturer='Emmett S'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perUser'
+            SummaryCodepage='1252'
+            />
+
+        <!-- perUser scope: InstallScope='perUser' on the Package element above
+             is sufficient on WiX 3.11+ to make this a per-user install with no
+             UAC. We deliberately do NOT declare ALLUSERS or MSIINSTALLPERUSER
+             Properties: `<Property Id='ALLUSERS' Value=''/>` is rejected by WiX
+             3.11 candle with CNDL0006 ("Value cannot be an empty string"), and
+             MSIINSTALLPERUSER is redundant when InstallScope='perUser' is set.
+             The WiX 3 docs say InstallScope='perUser' is equivalent to setting
+             ALLUSERS='' or not setting ALLUSERS at all. -->
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='wb300 (Corporate Edition) Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='LocalAppDataFolder'>
+                <Directory Id='ProgramsFolder' Name='Programs'>
+                    <Directory Id='APPLICATIONFOLDER' Name='wb300'>
+                        <!-- Install-source marker. `wb300 update` reads this
+                             from HKCU and picks the matching installer to
+                             download for in-place upgrades. Value must match
+                             the `msi-corporate` arm in src/update.rs. -->
+                        <Component Id='InstallSourceMarker' Guid='E4F9A039-7B60-4C06-88DE-6F152298F62E'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\WB300'
+                                Name='InstallSource'
+                                Type='string'
+                                Value='msi-corporate'
+                                KeyPath='yes'/>
+                        </Component>
+                        <Directory Id='Bin' Name='bin'>
+                            <Component Id='Path' Guid='C03D7DF2-0416-4404-82FA-D9BD1EF03827' KeyPath='yes'>
+                                <!-- User PATH (HKCU\Environment\Path), not system PATH. -->
+                                <Environment
+                                    Id='PATH'
+                                    Name='PATH'
+                                    Value='[Bin]'
+                                    Permanent='no'
+                                    Part='last'
+                                    Action='set'
+                                    System='no'/>
+                            </Component>
+                            <Component Id='binary0' Guid='*'>
+                                <File
+                                    Id='exe0'
+                                    Name='wb300.exe'
+                                    DiskId='1'
+                                    Source='$(var.CargoTargetBinDir)\wb300.exe'
+                                    KeyPath='yes'/>
+                            </Component>
+                        </Directory>
+                    </Directory>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs the wb300 binary (Corporate Edition, per-user).'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='InstallSourceMarker'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location of [ProductName] to your user PATH so the binary is callable from any terminal.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/QubeTX/qube-workbranch-view'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

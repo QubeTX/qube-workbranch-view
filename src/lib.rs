@@ -14,10 +14,15 @@ pub mod process;
 pub mod storage;
 pub mod terminal;
 pub mod ui;
+pub mod update;
 pub mod util;
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// The crate version (`CARGO_PKG_VERSION`), surfaced for `wb300 update`'s
+/// "current version" comparison and the `--version` flag.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use app::{AppState, LiveStatus};
 use cli::{Cli, Command};
@@ -33,10 +38,16 @@ const ARCHIVE_MAX: usize = 2000;
 pub async fn run(cli: Cli) -> Result<()> {
     terminal::install_panic_hook()?;
 
-    if let Some(Command::Update(_)) = cli.command {
-        // Registry-aware self-update lands in the packaging phase (Phase 9).
-        println!("wb300 update is not implemented yet.");
-        return Ok(());
+    if let Some(Command::Update(args)) = &cli.command {
+        // Self-update runs entirely outside the TUI (no terminal takeover) and
+        // returns a process exit code; `--no-color` drives both ANSI color and
+        // the ASCII-vs-Unicode glyph choice.
+        let opts = update::UpdateOptions {
+            json: args.json,
+            use_colors: !cli.no_color,
+            use_unicode: !cli.no_color,
+        };
+        std::process::exit(update::run(&opts));
     }
 
     let start_dir = match &cli.repo {

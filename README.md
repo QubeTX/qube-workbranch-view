@@ -20,9 +20,11 @@ The archive is the black box recorder.
 Ratatui is the cockpit.
 ```
 
-> **Status: early.** The terminal shell and packaging are in place; the live worktree
-> intelligence lands phase by phase (see `docs/WB-300_HANDOFF_PLAN.md`). The first tagged
-> release wires up the installers below.
+> **Status: pre-1.0.** The live worktree intelligence — discovery, status, process mapping,
+> the live engine, collisions, remote/pushed state, and safe cleanup — is in place, along with
+> full cross-platform packaging and a registry-aware self-updater. The machine-wide home view
+> and the headless `wb300 agent` JSON snapshot land next (see `docs/WB-300_HANDOFF_PLAN.md`).
+> The installers below go live with the first tagged release.
 
 ## Features (in progress)
 
@@ -48,14 +50,28 @@ WB-300 ships the same way as the rest of the QubeTX line. (Available from the fi
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/QubeTX/qube-workbranch-view/releases/latest/download/wb300-installer.sh | sh
 ```
 
-### Windows
+### Windows — PowerShell (quickest)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/QubeTX/qube-workbranch-view/releases/latest/download/wb300-installer.ps1 | iex"
 ```
 
-Windows also gets four first-class installers — Global / Corporate editions, each as MSI and
-EXE — none of which require Rust on the install machine.
+### Windows — first-class installers
+
+Four signed-style installers, none of which need Rust on the install machine. **Pick one
+format per edition** — installing both MSI and EXE of the same edition leaves two Add/Remove
+Programs entries pointing at the same binary.
+
+| Edition | Scope | Admin? | Installs to | Asset |
+|---|---|---|---|---|
+| **Global MSI** | perMachine | yes (UAC) | `C:\Program Files\wb300\bin` | `wb300-x86_64-pc-windows-msvc.msi` |
+| **Corporate MSI** | perUser | no | `%LocalAppData%\Programs\wb300\bin` | `wb300-x86_64-pc-windows-msvc-corporate.msi` |
+| **Global EXE** | perMachine | yes (UAC) | `C:\Program Files\wb300\bin` | `wb300-x86_64-pc-windows-msvc-setup.exe` |
+| **Corporate EXE** | perUser | no | `%LocalAppData%\Programs\wb300\bin` | `wb300-x86_64-pc-windows-msvc-corporate-setup.exe` |
+
+Each ships a `.sha256` sidecar. The **Corporate** editions need no admin rights — the right
+pick on locked-down corporate workstations. All four add `wb300` to the appropriate PATH and
+record how they were installed so `wb300 update` later fetches the matching installer.
 
 ### Cargo
 
@@ -86,15 +102,28 @@ wb300 update             # self-update to the latest release
 
 ```txt
 q / Esc   quit / close overlay      Tab / Shift+Tab   next / previous tab
-?         help                      1 – 6             jump to a tab
+?         help                      1 – 7             jump to a tab
+j / k     move selection            r                 refresh snapshot
+/         filter worktrees          f                 fetch from remotes (never automatic)
+:         command palette           x                 remove selected worktree (type-to-confirm)
+                                     p                 prune stale worktree metadata (confirm)
 ```
 
 (The full, configurable keybinding set lands with the config subsystem.)
 
 ## Self-update
 
-`wb300 update` updates in place via cargo or the prebuilt installers, including the
-registry-aware Windows installer path. See `CLAUDE.md` for the maintenance contract.
+```sh
+wb300 update          # update in place to the latest release
+wb300 update --json   # machine-readable result (for orchestrating agents)
+```
+
+`wb300 update` checks the GitHub releases API and updates in place via `cargo install` or the
+prebuilt installers. On Windows it is **registry-aware**: the four first-class installers each
+record an install marker (`HKCU\Software\WB300\InstallSource`), and `update` downloads the
+*matching* installer, verifies its SHA-256 against the published sidecar, runs it, and confirms
+the new `--version` — so a perUser Corporate install upgrades without ever prompting for admin.
+See `CLAUDE.md` for the maintenance contract (the installer ⇄ `src/update.rs` lockstep).
 
 ## Development
 

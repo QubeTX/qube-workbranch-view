@@ -96,8 +96,30 @@ When the operator says *"deploy a new version"*:
 8. **Fix-forward on failure:** fix the root cause, **bump the patch version** (never re-tag an
    existing version, never force-push `main`), re-run.
 
-Once Phase 9 lands, `./deploy.sh bump <patch|minor|major|X.Y.Z>` then `./deploy.sh tag`
-automate steps 1–5.
+### `deploy.sh` (the canonical one-command path)
+
+`./deploy.sh` scripts steps 1–5 in two explicit phases that respect the PR gate:
+
+```sh
+# Phase 1 — on the workbranch (bumps, guards, gates, commits, pushes):
+./deploy.sh bump <patch|minor|major|X.Y.Z>
+#   → bumps [package] version + refreshes Cargo.lock
+#   → lockstep guard: hard-stops unless CHANGELOG.md has a `## [X.Y.Z]` section
+#     AND HUMAN_CHANGELOG.md changed since the last tag
+#   → runs fmt / clippy -D warnings / test --locked / publish --dry-run --locked
+#   → commits ONLY Cargo.toml, Cargo.lock, CHANGELOG.md, HUMAN_CHANGELOG.md
+#     (+ the Co-Authored-By trailer) and pushes the branch
+# Then YOU merge the PR to main (the gate). crates-publish.yml runs.
+
+# Phase 2 — on main, after the merge (verifies, tags, pushes the tag):
+./deploy.sh tag
+#   → refuses a dirty tree, a non-main branch, a divergent main, or a CI run
+#     that isn't green (override with DEPLOY_SKIP_CI_CHECK=1)
+#   → refuses to re-tag an existing version; never force-pushes
+#   → creates + pushes vX.Y.Z → fires release.yml → windows-installers.yml
+```
+
+Prefer `deploy.sh`; the manual steps above are what it automates (run/verify either).
 
 ### Downstream homepage sync
 
@@ -108,13 +130,22 @@ and its install links point at `releases/latest/download/…` — both version-a
 homepage **only** when something **outward-facing** changes: new features, new/changed install
 methods, renamed commands/flags, a new tagline, or new screenshots.
 
-## Windows distribution (Phase 9 — in progress)
+## Windows distribution
 
-Four first-class installers (Global / Corporate × MSI / EXE) via `wix/` + `wix-corporate/` +
-`inno/`, plus a registry-aware `wb300 update`. **Lockstep contract:** the install paths and
-`HKCU\Software\WB300\InstallSource` marker values in `wix/`, `wix-corporate/`, and `inno/` must
-change together with `src/update.rs::detect_install_origin()` in the same commit. Product GUIDs
-are **permanent** — regenerating them breaks in-place upgrades.
+Four first-class installers (Global / Corporate × MSI / EXE) via `wix/main.wxs` (Global MSI,
+cargo-dist-built during `release.yml`), `wix-corporate/corporate.wxs` (Corporate MSI),
+`inno/global.iss` + `inno/corporate.iss` (the two EXEs) — all attached by
+`.github/workflows/windows-installers.yml`, which chains off `release.yml` via `workflow_run`
+and uploads the 6 add-on assets (3 installers + 3 `.sha256` sidecars). Plus a registry-aware
+`wb300 update` (`src/update.rs`) that reads the install marker and self-updates via the
+matching installer (SHA-256-verified) on Windows, or `cargo` / shell installer elsewhere.
+
+**Lockstep contract:** the install paths and `HKCU\Software\WB300\InstallSource` marker values
+in `wix/main.wxs`, `wix-corporate/corporate.wxs`, `inno/global.iss`, and `inno/corporate.iss`
+must change **together with** `src/update.rs::detect_install_origin()` (and its
+`read_install_source_marker` arms) in the same commit. The four edition values are
+`msi-global` / `msi-corporate` / `exe-global` / `exe-corporate`. Product GUIDs (MSI
+`UpgradeCode`s, Inno `AppId`s) are **permanent** — regenerating them breaks in-place upgrades.
 
 ## Git workflow
 

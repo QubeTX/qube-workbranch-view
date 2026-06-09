@@ -50,6 +50,20 @@ sysinfo = "0.39.3"
 notify = "8.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# HTTP client for `wb300 update`: queries the GitHub releases API and (on
+# Windows) downloads the matching MSI/EXE installer. Blocking + tiny dep tree;
+# the updater runs synchronously outside the Tokio TUI loop.
+ureq = { version = "2", features = ["tls", "json"] }
+
+# Windows-only self-update support (mirrors TR-300):
+#   - winreg reads HKCU\Software\WB300\InstallSource so `wb300 update` picks the
+#     installer matching how the binary was installed (~5 lines of safe Rust vs
+#     ~30 lines of unsafe via the raw Win32 registry API).
+#   - sha2 verifies the SHA-256 of the downloaded installer against the .sha256
+#     sidecar before launching it (MITM / corrupted-download guard).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+sha2 = "0.10"
 
 [build-dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
