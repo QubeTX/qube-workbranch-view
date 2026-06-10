@@ -34,6 +34,9 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
                 EventKind::WorktreeCreated => Span::from("created").fg(Color::Cyan),
                 EventKind::WorktreeRemoved => Span::from("removed").fg(theme::COLLISION),
                 EventKind::ConflictRisk => Span::from("conflict-risk").fg(theme::DIRTY),
+                EventKind::BranchCommitted => Span::from("committed").fg(theme::COMMITTED),
+                EventKind::BranchPushed => Span::from("pushed").fg(theme::CLEAN),
+                EventKind::BranchMerged => Span::from("merged").fg(theme::DIM),
             };
             let name = ev.branch.clone().unwrap_or_else(|| ev.path.clone());
             let mut spans = vec![

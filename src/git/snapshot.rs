@@ -15,7 +15,8 @@ use crate::util::paths::normalize;
 /// Max concurrent Git subprocesses during a capture (handoff §21.3).
 const GIT_CONCURRENCY: usize = 4;
 
-/// A point-in-time view of the repository: worktrees, refs, collisions, processes.
+/// A point-in-time view of the repository: worktrees, refs, the derived
+/// branch hierarchy, collisions, processes.
 #[derive(Debug, Clone)]
 pub struct RepoSnapshot {
     pub repo: RepoIdentity,
@@ -23,8 +24,13 @@ pub struct RepoSnapshot {
     pub base: Option<String>,
     pub worktrees: Vec<WorktreeRecord>,
     pub branches: Vec<BranchInfo>,
+    /// The derived branch tree (trunk → workbranches → tasks), with per-branch
+    /// lifecycle and worktree attachment.
+    pub hierarchy: super::hierarchy::BranchHierarchy,
     pub collisions: Vec<Collision>,
     pub processes: ProcessSnapshot,
+    /// Epoch seconds when this capture completed (drives staleness chips).
+    pub captured_at: u64,
 }
 
 impl RepoSnapshot {
@@ -50,6 +56,12 @@ impl RepoSnapshot {
         .await?;
         let branches = parse_refs(&ref_bytes);
         let base = detect_base(&branches);
+
+        // The hierarchy skeleton (topology + parentage) — one cached rev-list,
+        // run serially here so the per-worktree stream below keeps the git
+        // concurrency cap intact. Worktree indices and lifecycle are resolved
+        // after statuses land.
+        let hierarchy = super::hierarchy::compute(&repo, &branches).await;
 
         // Collect owned (index, path) jobs first so the async tasks borrow
         // nothing from `worktrees` — keeping the capture future `Send + 'static`
@@ -96,6 +108,7 @@ impl RepoSnapshot {
             worktrees[idx].status = status;
         }
 
+        let hierarchy = hierarchy.finalize(&branches, &worktrees);
         let collisions = crate::collision::compute(&worktrees);
 
         // Map OS processes to worktrees (sync sysinfo scan, off the executor).
@@ -109,8 +122,10 @@ impl RepoSnapshot {
             base,
             worktrees,
             branches,
+            hierarchy,
             collisions,
             processes,
+            captured_at: crate::storage::events::epoch_secs(),
         })
     }
 
@@ -149,9 +164,15 @@ fn merge_touched(status: Option<&WorktreeStatus>, committed: Vec<FileChange>) ->
         .collect()
 }
 
-/// Pick a base branch for "committed since base" comparisons: the first of
-/// `origin/main`, `origin/master`, `main`, `master` that exists.
+/// Pick a base branch for "committed since base" comparisons: the remote
+/// default branch (the `origin/HEAD` symref target) when present, else the
+/// first of `origin/main`, `origin/master`, `main`, `master` that exists.
 fn detect_base(branches: &[BranchInfo]) -> Option<String> {
+    if let Some(target) = branches.iter().find_map(|b| b.symref_target.as_deref())
+        && branches.iter().any(|b| b.short == target)
+    {
+        return Some(target.to_string());
+    }
     const PREFERRED: &[&str] = &["origin/main", "origin/master", "main", "master"];
     PREFERRED
         .iter()
