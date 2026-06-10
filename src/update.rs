@@ -153,7 +153,7 @@ impl UpdateStrategy {
 /// the cargo install / PowerShell installer path that doesn't write a marker.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallOrigin {
+pub(crate) enum InstallOrigin {
     /// `C:\Program Files\wb300\bin\wb300.exe`, installed from wix/main.wxs.
     MsiGlobal,
     /// `%LocalAppData%\Programs\wb300\bin\wb300.exe`, from wix-corporate/corporate.wxs.
@@ -175,7 +175,7 @@ impl InstallOrigin {
     /// String form for JSON output. Matches the registry marker values
     /// written by the installers; `cargo-or-installer` / `unknown` are
     /// synthesized by the path-based fallback.
-    fn json_id(self) -> &'static str {
+    pub(crate) fn json_id(self) -> &'static str {
         match self {
             InstallOrigin::MsiGlobal => "msi-global",
             InstallOrigin::MsiCorporate => "msi-corporate",
@@ -1157,7 +1157,7 @@ fn read_install_source_marker() -> Option<InstallOrigin> {
 /// one format per edition"). When the marker IS present, the EXE vs MSI
 /// distinction is preserved.
 #[cfg(windows)]
-fn detect_install_origin() -> InstallOrigin {
+pub(crate) fn detect_install_origin() -> InstallOrigin {
     if let Some(origin) = read_install_source_marker() {
         return origin;
     }

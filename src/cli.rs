@@ -10,7 +10,9 @@ use std::path::PathBuf;
 #[command(
     name = "wb300",
     version,
-    about = "Live TUI control tower for Git worktrees used by parallel coding agents"
+    about = "Live TUI control tower for the branches and worktrees used by parallel coding agents",
+    // `wb300 help` is our full manual (src/help.rs), not clap's usage dump.
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     // Path to the Git repository to open (defaults to the current directory).
@@ -50,17 +52,37 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    // Print the full manual — every view, key, glyph, and concept — and exit.
+    Help,
     // Self-update wb300 to the latest release.
     Update(UpdateArgs),
     // Print the full repository state as JSON and exit (no TUI) — a headless
     // snapshot for orchestrating agents. Outside a repo (or with --home) it
     // prints the machine-wide view of every active repository.
     Agent,
+    // Uninstall wb300 from this machine (detects how it was installed and
+    // runs the matching uninstaller).
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
     // Emit machine-readable JSON describing the update outcome.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UninstallArgs {
+    // Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    // Also remove wb300's state, config, and registry entries (kept by default).
+    #[arg(long)]
+    pub purge: bool,
+
+    // Emit machine-readable JSON describing the uninstall outcome.
     #[arg(long)]
     pub json: bool,
 }
