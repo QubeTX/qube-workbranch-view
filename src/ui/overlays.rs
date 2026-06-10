@@ -80,25 +80,28 @@ pub(crate) fn render_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
 }
 
 pub(crate) fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = center(area, Constraint::Percentage(60), Constraint::Length(19));
+    let popup = center(area, Constraint::Percentage(62), Constraint::Length(24));
     let text = vec![
         Line::from("WB-300 — keybindings".bold()),
         Line::from(""),
         Line::from("  q / Esc    quit / close overlay"),
         Line::from("  ?          toggle this help"),
-        Line::from("  Tab        next tab"),
-        Line::from("  Shift+Tab  previous tab"),
+        Line::from("  Tab / 1-6  switch tab"),
         Line::from("  j / k      move selection down / up"),
+        Line::from("  l / h      expand / collapse a tree node"),
+        Line::from("  Enter      toggle expansion"),
+        Line::from("  a          show active branches only / all branches"),
         Line::from("  r          refresh the snapshot"),
         Line::from("  f          fetch from remotes"),
-        Line::from("  /          search / filter worktrees"),
+        Line::from("  /          filter branches by name"),
         Line::from("  :          command palette"),
-        Line::from("  x          remove selected worktree (type-to-confirm)"),
+        Line::from("  x          remove the selected branch's worktree (confirm)"),
         Line::from("  K          kill attached agent / selected process (confirm)"),
         Line::from("  p          prune stale worktree metadata"),
-        Line::from("  1 – 7      jump to a tab"),
         Line::from(""),
-        Line::from("Live worktree intelligence arrives phase by phase.".fg(theme::DIM)),
+        Line::from("The tree is your branch hierarchy: repo → main →".fg(theme::DIM)),
+        Line::from("workbranch → task branches. ⌂ marks each branch's".fg(theme::DIM)),
+        Line::from("worktree; dimmed = no worktree, agent, or unmerged work.".fg(theme::DIM)),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(

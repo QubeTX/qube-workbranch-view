@@ -49,7 +49,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
         .collect();
 
     let list = List::new(items).block(Block::bordered().title(
-        " Cleanup — ✓ safe · ! caution/uncommitted · ✗ active   (select in Worktrees, then x) ",
+        " Cleanup — ✓ safe · ! caution/uncommitted · ✗ active   (select in Branches, then x) ",
     ));
     frame.render_widget(list, area);
 }

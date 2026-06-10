@@ -4,6 +4,7 @@ pub mod action;
 pub mod overlay;
 pub mod state;
 pub mod transitions;
+pub mod tree;
 
 pub use action::Action;
 pub use overlay::{Command, Confirm, ConfirmAction, Overlay, Palette, PendingGit, PendingKill};
