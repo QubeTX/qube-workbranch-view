@@ -16,5 +16,5 @@ pub mod worktree;
 pub use refs::BranchInfo;
 pub use repo::RepoIdentity;
 pub use snapshot::RepoSnapshot;
-pub use status::WorktreeStatus;
+pub use status::{ChangeKind, FileChange, WorktreeStatus};
 pub use worktree::WorktreeRecord;

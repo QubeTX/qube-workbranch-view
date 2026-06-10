@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use super::commands::git_stdout;
 use super::refs::{BranchInfo, FOR_EACH_REF_FORMAT, parse_refs};
 use super::repo::RepoIdentity;
-use super::status::parse_status_v2;
+use super::status::{ChangeKind, FileChange, WorktreeStatus, parse_status_v2};
 use super::worktree::{WorktreeRecord, parse_worktrees};
 use crate::collision::Collision;
 use crate::process::ProcessSnapshot;
@@ -61,8 +61,10 @@ impl RepoSnapshot {
             .map(|(idx, wt)| (idx, std::path::PathBuf::from(&wt.path)))
             .collect();
 
-        // Per-worktree status + touched-file sets, with bounded concurrency so a
-        // repo with many worktrees doesn't serialize a long chain of git calls.
+        // Per-worktree status + committed-since-base files, with bounded
+        // concurrency so a repo with many worktrees doesn't serialize a long
+        // chain of git calls. Working-tree changes come from the status parse
+        // itself — no separate diff calls needed for them.
         let per_worktree = futures_util::stream::iter(jobs.into_iter().map(|(idx, path)| {
             let base = base.clone();
             async move {
@@ -78,17 +80,20 @@ impl RepoSnapshot {
                             None
                         }
                     };
-                let touched = super::diff::touched_files(&path, base.as_deref()).await;
-                (idx, status, touched)
+                let committed = match base.as_deref() {
+                    Some(base) => super::diff::committed_files(&path, base).await,
+                    None => Vec::new(),
+                };
+                (idx, status, committed)
             }
         }))
         .buffer_unordered(GIT_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
 
-        for (idx, status, touched) in per_worktree {
+        for (idx, status, committed) in per_worktree {
+            worktrees[idx].touched = merge_touched(status.as_ref(), committed);
             worktrees[idx].status = status;
-            worktrees[idx].touched = touched;
         }
 
         let collisions = crate::collision::compute(&worktrees);
@@ -124,6 +129,24 @@ impl RepoSnapshot {
             .iter()
             .position(|wt| normalize(&wt.path) == root)
     }
+}
+
+/// Union of a worktree's working-tree changes and its committed-since-base
+/// files, keyed by path. The working-tree kind wins (it is the current state).
+/// Sorted by path, de-duplicated.
+fn merge_touched(status: Option<&WorktreeStatus>, committed: Vec<FileChange>) -> Vec<FileChange> {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, ChangeKind> =
+        committed.into_iter().map(|f| (f.path, f.kind)).collect();
+    if let Some(s) = status {
+        for f in &s.changes {
+            by_path.insert(f.path.clone(), f.kind);
+        }
+    }
+    by_path
+        .into_iter()
+        .map(|(path, kind)| FileChange { path, kind })
+        .collect()
 }
 
 /// Pick a base branch for "committed since base" comparisons: the first of
