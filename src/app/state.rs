@@ -1020,25 +1020,6 @@ pub(crate) fn wt_flash_key(repo_key: &str, wt: &WorktreeRecord) -> String {
     }
 }
 
-/// Flash a blue `Activity` marker on the worktree containing each changed path.
-/// Driven by the (un-debounced) filesystem watcher so the marker tracks live
-/// save state. Paths that fall outside every known worktree are ignored.
-/// Used by the home reducer (still keyed by worktree path).
-pub(crate) fn note_activity_for(
-    transitions: &mut Transitions,
-    worktrees: &[WorktreeRecord],
-    paths: &[std::path::PathBuf],
-) {
-    use crate::util::paths::{longest_prefix_match, normalize};
-    let roots: Vec<String> = worktrees.iter().map(|w| normalize(&w.path)).collect();
-    for path in paths {
-        let probe = normalize(&path.to_string_lossy());
-        if let Some(idx) = longest_prefix_match(&probe, &roots) {
-            transitions.note(worktrees[idx].path.clone(), TransitionKind::Activity);
-        }
-    }
-}
-
 /// Tree-keyed activity pulses: the owning branch's row flashes, and when the
 /// changed path maps to a known touched file, that file's row flashes too.
 pub(crate) fn note_activity_tree(
