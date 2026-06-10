@@ -8,6 +8,100 @@ When you add or amend an entry here, update `HUMAN_CHANGELOG.md` in the same com
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-10
+
+**The corrected-model release.** v1 was built on a wrong assumption — that one branch can have
+many simultaneous worktrees. Git's real rule is that a branch is checked out in at most ONE
+worktree, so the true shape of parallel agent work is a branch tree: trunk → daily workbranch →
+task branches, one agent per branch per worktree. v2 rebuilds the product around that: the main
+view IS the branch hierarchy (derived from commit topology, not name prefixes), and worktrees/
+agents/files are attributes of branches.
+
+### Added
+- **Branch hierarchy derivation** (`git/hierarchy.rs`): trunk/workbranch/task/standalone roles
+  and parent pointers computed from one batched, fingerprint-cached
+  `rev-list --topo-order <tips> --not <trunk>` over the off-trunk history. Parent selection is
+  nearest-strict-ancestor; the `wb-` naming convention only breaks equal-tip ties and diverged
+  (un-rebased) cases. `ahead_of_parent`/`behind_parent` (the "needs rebase" signal, bounded
+  `--left-right --count` for trunk children), `merged_into_parent`, and graceful degradation:
+  no convention → standalones under trunk; no trunk → flat; rev-list failure/cap → an
+  `approximate` flag, never an error. The remote default branch is recognized via the
+  `origin/HEAD` symref (also preferred by base detection).
+- **Per-branch lifecycle** (`git/lifecycle.rs`): `uncommitted → committed → pushed → merged`
+  (+ `fresh`, + a watcher-driven `editing` refinement) as a pure decision table over worktree
+  status, the new `%(upstream:track)` ahead/behind captured for EVERY branch (`git/refs.rs`),
+  and parent containment. Documented limit: a squash-merged branch reads `committed` until
+  deleted (squash merges are graph-invisible).
+- **Branch-first tree UI** (`app/tree.rs`, `ui/tree.rs`, `ui/branches.rs`): the Branches tab
+  renders repo → trunk/workbranches (siblings) → task branches with indent guides, lifecycle
+  status column, `● agent` badges, `⌂` worktree paths, and expandable changed-file rows (capped
+  at 30 + an overflow row). Expansion/selection are keyed by branch NAME so they survive
+  refreshes; flashes re-keyed likewise (`NodeId::flash_key`); per-file blue `◆` save pulses;
+  vim-style `l`/`h` expand/collapse, `Enter`/`Space` toggle; `a` switches active-only ⇄ all
+  (inactive branches render dimmed; "active" = worktree ∨ agent ∨ unmerged/unpushed work ∨
+  active descendant). Detached worktrees appear as leaf rows.
+- **Per-file change kinds** (`git/status.rs`, `git/diff.rs`): `WorktreeRecord::touched` is now
+  `Vec<FileChange>` (modified/added/deleted/renamed/untracked/conflicted), extracted from the
+  existing porcelain-v2 status parse plus ONE `diff --name-status -z base...HEAD` call —
+  replacing three name-only diff queries (capture is now cheaper than v1.2). Collision
+  detection skips untracked files explicitly (same semantics, now stated).
+- **Branch milestone events** (`storage/events.rs`, `app::state::branch_events`): new
+  `BranchCommitted` (rebase-suppressed) / `BranchPushed` / `BranchMerged` event kinds with
+  optional `parent`/`repo`/`files` payloads (old `events.jsonl` lines still deserialize), shown
+  in the Timeline and feeding notifications. Conflict-risk diffing extracted
+  (`conflict_events`) and shared with home mode.
+- **OS toast notifications** (`notifications.rs`): native toasts for exactly commit / push /
+  merge-conflict-risk — never agent-exit or idle. A notifier task owns policy: 1.5s coalescing
+  ("3 branches pushed (…)"), per-(repo, branch, kind) 30s cooldown, per-kind gating; backend
+  calls run off the executor and any failure logs once and disables toasts for the session.
+  Windows self-registers the `QubeTX.WB300` AppUserModelID under HKCU (untagged fallback);
+  Linux uses notify-rust's pure-Rust zbus backend (no libdbus). New deps: `notify-rust`, `toml`.
+- **Minimal TOML config** (`config.rs`): `[notifications] enabled/commit/push/conflict_risk/
+  cooldown_secs` at `%LOCALAPPDATA%\wb300\config.toml` / `~/.config/wb300/config.toml`;
+  missing → defaults, malformed → one warning + defaults, unknown keys ignored. New global
+  `--no-notify` flag.
+- **`wb300 help`** (`help.rs`): the full manual in the terminal — model, views, lifecycle
+  stages, glyph legend, keys, notifications, commands, files, troubleshooting — paged via
+  `$PAGER`/`less`/`more` on a TTY, plain when piped (clap's stub help subcommand is disabled
+  in its favor).
+- **`wb300 uninstall`** (`uninstall.rs`): channel-aware removal. Windows MSI/EXE: finds the
+  Add/Remove Programs entry and launches its uninstaller detached (quiet `/SILENT` or MSI
+  `/passive`) so it can delete the running exe after exit; cargo installs: direct on Unix, a
+  detached delayed helper on Windows; bare binaries: unlinked on Unix. `--yes`, `--json`, and
+  `--purge` (state + config dirs, `HKCU\Software\WB300`, the toast AUMID key). Repositories are
+  never touched. (The four installers already remove their own `InstallSource` markers on
+  uninstall — WiX component teardown / Inno `uninsdeletevalue` — so the lockstep contract is
+  unchanged.)
+- Per-repo `captured_at` on snapshots; home repo rows show a red staleness chip past 60s
+  without a recapture.
+
+### Changed
+- **BREAKING — tab set and keys:** `Branches` replaces both `Overview` (its counts + freshness
+  moved into an always-visible header strip) and the flat `Worktrees` tab; tabs are now
+  Branches / Processes / Merge Risk / Cleanup / Timeline / Help on keys `1–6`. New keys:
+  `l`/`h`, `Enter`/`Space`, `a`. `x` removes the selected **branch's** worktree (dialog states
+  the branch and its commits are kept); `K` kills the selected branch's agent. `/` filters
+  branch names (ancestors of matches stay visible). `Tab::Collisions` renamed `Tab::MergeRisk`.
+- **BREAKING — `wb300 agent` schema v2:** `workbranches` (the name-prefix grouping) and
+  `worktrees[].workbranch` are gone; each repo now carries `branches` — the hierarchy in
+  depth-first order with `parent` pointers, `role`, `lifecycle`, `ahead_of_parent`/
+  `behind_parent`, `active`, upstream tracking, `worktree` path, `agent`, and `files`
+  (≤ 50 + `files_total`) — plus `trunk` and `hierarchy_approximate`. `workbranch_label()` is
+  deleted: "workbranch" now only ever means the real `<dev>/wb-<date>` tier.
+- **Machine-wide home view is one unified tree** with a repo node per repository — same widget,
+  keys, and flash language as the per-repo view; `Enter` drills in for mutations; per-repo
+  staleness chips. (Previously a two-pane card list grouped by the fake workbranch label.)
+- Merge Risk copy says **branches** ("files changed on 2+ branches"); Cleanup points at the
+  Branches tab; help overlay rewritten around the hierarchy; palette labels updated.
+- `ui/mod.rs` split into per-tab modules (`branches`, `processes`, `merge_risk`, `cleanup`,
+  `timeline`, `overlays`, `tree`, `util`); `ui/overview.rs` and `ui/worktrees.rs` deleted.
+
+### Fixed
+- Rebases no longer read as commit milestones (suppressed when ahead-of-parent didn't grow and
+  behind-parent drained to zero).
+- A branch tree node whose parent is missing from the node set is rendered as a root instead of
+  silently dropped (defensive guard in `flatten`).
+
 ## [1.2.0] - 2026-06-09
 
 A live-activity and agent-control release: a refined per-worktree visual language, the ability
