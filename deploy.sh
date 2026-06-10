@@ -179,7 +179,10 @@ cmd_bump() {
 
     run_gates
 
-    git add Cargo.toml Cargo.lock CHANGELOG.md HUMAN_CHANGELOG.md
+    # The gate build regenerated man/wb300.1 with the new version string —
+    # commit it too, or main ships a man page whose header carries the OLD
+    # version (this bit v2.0.0; v1.2.0 had added it to this commit by hand).
+    git add Cargo.toml Cargo.lock CHANGELOG.md HUMAN_CHANGELOG.md man/wb300.1
     git commit -m "chore(release): wb300 v$new
 
 $CO_AUTHOR_TRAILER"
