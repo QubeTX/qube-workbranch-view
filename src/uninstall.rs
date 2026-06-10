@@ -173,8 +173,10 @@ fn find_uninstall_entry() -> Option<UninstallEntry> {
             let Ok(display): Result<String, _> = entry.get_value("DisplayName") else {
                 continue;
             };
+            // Exact product names only (per wix/*.wxs and inno/*.iss) — a
+            // substring match could launch some other product's uninstaller.
             let lower = display.to_lowercase();
-            if !(lower.contains("wb300") || lower.contains("wb-300")) {
+            if !(lower == "wb300" || lower == "wb300 (corporate edition)") {
                 continue;
             }
             let quiet_cmd: Option<String> = entry.get_value("QuietUninstallString").ok();
@@ -200,7 +202,15 @@ fn find_uninstall_entry() -> Option<UninstallEntry> {
 /// (running) executable after we exit.
 #[cfg(windows)]
 fn launch_uninstaller(entry: &UninstallEntry) -> std::io::Result<()> {
-    let (program, args) = split_command_line(&entry.command);
+    // Windows Installer records UninstallString as `MsiExec.exe /I{GUID}` for
+    // many products (including our Global MSI) — /I on an installed product is
+    // maintenance/REPAIR mode, not uninstall. Always rewrite to /X.
+    let command = if entry.is_msi {
+        msi_uninstall_command(&entry.command)
+    } else {
+        entry.command.clone()
+    };
+    let (program, args) = split_command_line(&command);
     let mut cmd = std::process::Command::new(program);
     for a in args {
         cmd.arg(a);
@@ -212,8 +222,23 @@ fn launch_uninstaller(entry: &UninstallEntry) -> std::io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
+/// Force an msiexec command line into uninstall (`/X`) mode: registry
+/// UninstallStrings use `/I{GUID}`, `/X{GUID}`, `/x {GUID}`, … — extract the
+/// product GUID and rebuild as `MsiExec.exe /X{GUID}`. Falls back to the
+/// original string when no GUID is present.
+#[cfg(windows)]
+fn msi_uninstall_command(command: &str) -> String {
+    let (start, end) = match (command.find('{'), command.rfind('}')) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => return command.to_string(),
+    };
+    format!("MsiExec.exe /X{}", &command[start..=end])
+}
+
 /// Split a registry command line into (program, args): a leading quoted span
 /// or the text up to the first space, then whitespace-separated arguments.
+/// Known limit: a QUOTED argument after the program (e.g. `/LOG="a b.log"`)
+/// would be shredded — none of the four shipped installers record one.
 #[cfg(windows)]
 fn split_command_line(command: &str) -> (String, Vec<String>) {
     let command = command.trim();
@@ -360,6 +385,25 @@ fn purge_unix() -> bool {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msi_repair_strings_are_rewritten_to_uninstall() {
+        // The Global MSI's real-world UninstallString uses /I — repair mode.
+        assert_eq!(
+            msi_uninstall_command("MsiExec.exe /I{25F2F930-45D8-4D82-9B34-AF000887C395}"),
+            "MsiExec.exe /X{25F2F930-45D8-4D82-9B34-AF000887C395}"
+        );
+        assert_eq!(
+            msi_uninstall_command("MsiExec.exe /X{AAAA-BBBB}"),
+            "MsiExec.exe /X{AAAA-BBBB}"
+        );
+        assert_eq!(
+            msi_uninstall_command("msiexec.exe /x {CCCC-DDDD}"),
+            "MsiExec.exe /X{CCCC-DDDD}"
+        );
+        // No GUID → leave untouched.
+        assert_eq!(msi_uninstall_command("whatever.exe"), "whatever.exe");
+    }
 
     #[test]
     fn splits_quoted_and_unquoted_command_lines() {
