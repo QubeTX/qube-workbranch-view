@@ -5,6 +5,40 @@ numbers, file paths, or jargon. (Agents: keep this in lockstep with `CHANGELOG.m
 
 ## Unreleased
 
+## The board now shows your branches the way Git actually works
+
+We discovered the original design rested on a misunderstanding: we'd assumed one branch could
+live in many working folders at once. In reality, Git allows each branch to be checked out in
+exactly one folder — so the true picture of a fleet of agents is a *family tree of branches*:
+your main line, today's working branch off it, and one task branch per agent. This release
+rebuilds WB-300 around that truth.
+
+- **The main view is now that family tree.** Your main line at the top, today's working branch
+  beside it, and each agent's task branch nested underneath — with the agent's name on its
+  branch, the folder it lives in, and the exact files it's changing right now, expandable like
+  a file explorer. The tree is read from Git's actual history, not guessed from branch names.
+- **Every branch shows where its work stands** at a glance: being edited right now → has
+  unsaved-to-history changes (yellow) → committed but not yet sent (↑) → safely on the server
+  (✓) → folded into its parent (done). You can also see when a branch has fallen behind its
+  parent and needs to catch up.
+- **By default you only see what matters now** — branches with an agent, a folder, or
+  unfinished work. One key reveals everything else, dimmed.
+- **WB-300 can now tap you on the shoulder.** It sends a real system notification when a branch
+  gets new commits, when work reaches the server, and when two branches start changing the same
+  file — and never for anything else. A burst of activity becomes one notification ("3 branches
+  pushed"), repeats are quieted, and you can turn any of it off with a flag or a small settings
+  file.
+- **The whole-machine view is now one tree too**: every active project as a top-level entry,
+  every branch and agent beneath it — truly one window over the entire fleet. Press Enter on a
+  project to step inside it.
+- **A real manual, built in.** `wb300 help` prints the complete guide — what every view, color,
+  symbol, and key means — right in your terminal.
+- **A clean way out.** `wb300 uninstall` removes WB-300 properly no matter how you installed
+  it, asks before doing anything, and can optionally clear its settings and history too. It
+  never touches your projects.
+- The machine-readable snapshot other AI agents consume was upgraded to carry the real branch
+  tree; anything reading the old format will need the new one (the format is clearly labeled).
+
 ## Shut down a runaway agent, and a clearer live picture
 
 This release is about seeing the truth and acting on it:

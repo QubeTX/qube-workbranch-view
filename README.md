@@ -1,61 +1,84 @@
 # WB-300
 
-**Mission control for parallel Git worktrees.** Watch every agent workspace live.
+**Mission control for parallel coding agents.** One window, every repo, every branch, every agent — live.
 
-You're running a swarm of coding agents — Claude here, Codex there, a couple of builds, a
-test run — each on its own branch in its own Git worktree. They're all editing at once, and
-you have no Git-native, process-aware way to see what's actually alive, what's drifting, and
-where two of them are about to clobber the same file. `git status` in fifteen terminals is not
-a control tower.
+You're running a swarm of coding agents — Claude here, Codex there, a couple of builds, a test
+run. Git's rule is that a branch can be checked out in at most **one** worktree, so the real
+shape of that work is a **branch tree**: `main`, a daily workbranch off it, and a task branch
+per agent, each living in its own worktree. The work is the branches — and `git status` in
+fifteen terminals is not a control tower.
 
-**WB-300 (`wb300`) is the control tower.** Point it at a repo and it opens a live terminal
-dashboard that correlates your branches, your worktrees, and the **OS processes running inside
-each one** — so you can see, at a glance, which agent is working where, what's dirty, what just
-got pushed, what's about to collide, and what's safe to clean up. Run it *outside* a repo and
-it zooms out to a machine-wide view of every project being worked on across your whole machine.
-
-It is **not** a Git GUI. It's an operations console that happens to use Git and worktrees as
-the safest thing to observe:
+**WB-300 (`wb300`) is the control tower.** It draws your actual branch hierarchy as a live
+tree — which agent is on which branch, what files it's changing right now, what's uncommitted,
+what's committed, what's pushed, what's merged, and where two branches are about to collide.
+Run it inside a repo for that repo's tree; run it anywhere else and it zooms out to **every
+active repository on the machine in one view**. And when something important happens — a
+commit lands, work reaches the remote, two branches touch the same file — it can tap you on
+the shoulder with a native OS notification.
 
 ```txt
-Git is the source of truth.        ← never guessed, always asked
-Filesystem events are live hints.  ← a save lights up instantly
-Process scanning shows life signs. ← "● claude pid 109220" right on the worktree
+▾ qube-workbranch-view              12 branches · 2 agents
+├─ main                             ✓ pushed · clean
+└─ emmett/wb-2026-06-10             ↑2 committed, not pushed
+   ├─ feat/branch-tree-12           ● claude · ◆ editing
+   │  ⌂ ~/git/qwv-feat-branch-tree
+   │  ├─ src/ui/tree.rs             ~ modified
+   │  └─ src/app/state.rs           ~ modified
+   └─ fix/status-flash-9            ● codex · uncommitted
+      ⌂ ~/git/qwv-fix-status-flash
+      └─ src/live/mod.rs            ~ modified
+```
+
+It is **not** a Git GUI. It's an operations console built on what Git actually knows:
+
+```txt
+Git is the source of truth.        ← the tree is derived from commit topology, never guessed
+Filesystem events are live hints.  ← a save lights up the file being written
+Process scanning shows life signs. ← "● claude" right on the branch the agent is working
 Remote polling shows the outside.  ← pushed? it flashes green
-The archive is the black box.      ← created/removed worktrees, recorded
+The archive is the black box.      ← commits, pushes, merges, conflicts — recorded
+OS toasts are the tap on the shoulder. ← only for what you chose to hear about
 Ratatui is the cockpit.            ← fast, flicker-free, runs anywhere a terminal does
 ```
 
 ## What it does
 
-- **Sees every agent — the real ones.** It scans the OS process table, figures out which worktree
-  each process is living in, and labels it — Claude/Codex agents, builds, test runs, shells,
-  editors — with CPU, memory, and uptime. A green `● claude pid 1234` sits right on the worktree
-  it's in. It tells a real coding-agent CLI apart from the Claude *desktop* app, so "which
-  branches have an agent" stays trustworthy. Found a forgotten or stuck agent? `K` ends it,
-  behind a type-the-PID confirm (wb300 never kills anything on its own).
-- **Updates itself, live.** Save a file and a dot marks the worktree being written; its whole
-  line stays *yellow* the entire time it has uncommitted work; commit and the row flashes
-  *magenta*, push and it flashes *green* (commit-then-push back to back flashes magenta *then*
-  green), then it settles back. Another terminal creates or deletes a worktree and it notices and
-  records it. No refresh key required (though `r` is there if you want it). The Overview tells you
-  how many worktrees are being edited right now and how fresh the data is — and says **stale**
-  plainly if it ever can't read Git, rather than leaving old data looking live.
-- **Forecasts the merge hell.** Worktrees are isolated copies, so two agents editing the same
-  file in two worktrees aren't fighting *now* — but they'll clash when those branches merge back.
-  The **Merge Risk** view flags every file changed on two or more worktrees, names the agent on
-  each side, and color-codes by how scary the path is (lockfiles, migrations, and CI configs are
-  the scariest). New risks are recorded to the timeline as they appear.
-- **Cleans up — safely.** It scores each worktree (safe / caution / dirty / active / protected)
-  and lets you remove one behind a **type-the-name-to-confirm** dialog. Dirty work gets a rescue
-  patch saved *first*, and if that rescue can't be written, the delete is **aborted**. It will
-  not eat your uncommitted work.
-- **Zooms out.** Run it outside any repo (or `wb300 --home`) for a machine-wide tower of every
-  repo with a live agent or parallel worktrees, grouped by workbranch, with the same live
-  flashes — your single window over a fleet of agents across many projects.
-- **Talks to other agents.** `wb300 agent` prints the whole picture as JSON (no TUI) so an
-  orchestrating Claude/Codex/script can read the worktree/branch/agent/collision state in one
-  shot.
+- **Shows the real hierarchy.** The tree is derived from commit topology (one batched
+  `rev-list`, cached): trunk, workbranches, task branches, with naming conventions used only to
+  break genuine ties. Each branch row carries its lifecycle stage — *editing → uncommitted →
+  committed → pushed → merged* — its agent, its ⌂ worktree path, and expands into the exact
+  files being changed (`~` modified, `+` added, `-` deleted). Repos that don't follow any
+  convention degrade gracefully to a flat list. By default you see the branches that matter
+  *now* (a worktree, an agent, or unmerged work); `a` reveals everything else, dimmed.
+- **Sees every agent — the real ones.** It scans the OS process table, maps each process to its
+  worktree, and labels it — Claude/Codex agents, builds, tests, shells, editors — with CPU,
+  memory, and uptime. It tells a real coding-agent CLI apart from the Claude *desktop* app.
+  Found a forgotten or stuck agent? `K` ends it, behind a type-the-PID confirm (wb300 never
+  kills anything on its own).
+- **Updates itself, live.** Save a file and a blue ◆ pulses on that file's row and its branch;
+  a branch holds *yellow* the whole time it's uncommitted; commit and the row flashes *magenta*,
+  push and it flashes *green*, then it settles. Rebases don't masquerade as commits. The header
+  strip keeps the totals and data freshness always visible — and says **stale** plainly if it
+  ever can't read Git.
+- **Taps you on the shoulder.** Native OS notifications for exactly three things: a branch got
+  new commits, a branch's work reached the remote, and two branches started changing the same
+  file. Never for anything else. Bursts coalesce ("3 branches pushed"), repeats are suppressed,
+  and `--no-notify` or a small config file turns any of it off.
+- **Forecasts the merge hell.** The **Merge Risk** view flags every file changed on two or more
+  branches, names the agent on each side, and color-codes by how scary the path is (lockfiles,
+  migrations, and CI configs are the scariest). New risks are recorded — and toasted.
+- **Cleans up — safely.** `x` removes the selected branch's *worktree* (the branch and its
+  commits are kept) behind a type-the-name confirm. Dirty work gets a rescue patch saved
+  *first*, and if that rescue can't be written, the delete is **aborted**.
+- **Zooms out.** Outside a repo (or with `--home`) the same tree shows every active repository
+  as a root node — your single window over a fleet of agents across many projects. `Enter`
+  drills into a repo; `q` comes back.
+- **Talks to other agents.** `wb300 agent` prints the whole picture as JSON (schema
+  `wb300.agent.v2`): the branch hierarchy with roles, parents, lifecycle stages, agents, and
+  changed files — so an orchestrating Claude/Codex/script can read the state in one shot.
+- **Documents itself.** `wb300 help` prints the full manual — every view, key, glyph, and
+  concept — in the terminal. And `wb300 uninstall` removes it cleanly, whatever way it was
+  installed.
 
 ## Under the hood
 
@@ -71,13 +94,16 @@ it fast and safe to leave running on a busy machine:
 - **It drives the real `git` CLI** (via async subprocesses) instead of linking a Git library —
   your config, credential helpers, SSH setup, and Git-for-Windows quirks all apply unchanged.
   Parsing is NUL-safe (`-z` / porcelain v2) everywhere, so paths with spaces and newlines are fine.
-- **`sysinfo`** for the cross-platform process scan and **`notify`** for filesystem events —
-  the watcher only watches your source files (never `node_modules`/`target`/`.git`) and is
-  hard-capped, so it stays a good citizen of your OS's file-watch budget.
+- **The hierarchy is cheap.** Branch parentage comes from one batched, fingerprint-cached
+  `rev-list` over the off-trunk history — a capture costs *fewer* git subprocesses than v1 did,
+  and a poll where nothing changed costs no extra ones at all.
+- **`sysinfo`** for the cross-platform process scan, **`notify`** for filesystem events (pruned,
+  hard-capped watches), and **`notify-rust`** for OS toasts (pure-Rust zbus on Linux; on Windows
+  it self-registers a per-user AppUserModelID so toasts say "WB-300").
 - **One rule runs the whole thing:** `KeyEvent → Action → reducer → async task → snapshot →
   render`. The UI only ever *reads*; a single reducer is the only place state changes; the Git
-  snapshot is canonical and everything on screen is derived from it. Easy to reason about, easy
-  to test — it ships with a real unit + integration suite that runs Git against throwaway repos.
+  snapshot is canonical and everything on screen is derived from it. It ships with a real unit +
+  integration suite that runs Git against throwaway repos (including a bare "origin").
 
 And it's **safe by default**: it never fetches, pushes, rebases, resets, or kills anything on its
 own — every mutation is an explicit, confirmed keystroke (`f` fetch, `x` remove a worktree, `K`
@@ -113,7 +139,8 @@ Programs entries pointing at the same binary.
 
 Each ships a `.sha256` sidecar. The **Corporate** editions need no admin rights — the right
 pick on locked-down corporate workstations. All four add `wb300` to the appropriate PATH and
-record how they were installed so `wb300 update` later fetches the matching installer.
+record how they were installed so `wb300 update` (and `wb300 uninstall`) later act through the
+matching channel.
 
 ### Cargo
 
@@ -133,49 +160,76 @@ cargo build --release
 
 ```sh
 cd /path/to/git/repo
-wb300                    # open the live TUI
+wb300                    # open the live TUI (the branch tree)
 wb300 --repo /path/to/repo
 wb300 --home             # machine-wide view of every actively-worked-on repo
 wb300 --no-live          # static snapshot mode
+wb300 --no-notify        # no OS notifications this run
 wb300 --no-alt-screen    # fallback renderer
+wb300 help               # the full manual, in the terminal
 wb300 agent              # headless JSON snapshot (no TUI) — for other agents
 wb300 agent --home       # headless JSON for the whole machine
 wb300 update             # self-update to the latest release
+wb300 uninstall          # remove wb300 (--purge also removes state/config)
 ```
+
+## Notifications
+
+WB-300 sends native OS notifications for exactly three events — a branch got new commits, a
+branch's work reached its remote, and a new merge-conflict risk — and never for anything else.
+Bursts coalesce into one toast and repeats are suppressed per branch. Configure (or disable)
+them in `~/.config/wb300/config.toml` (Windows: `%LOCALAPPDATA%\wb300\config.toml`):
+
+```toml
+[notifications]
+enabled = true
+commit = true
+push = true
+conflict_risk = true
+cooldown_secs = 30
+```
+
+`--no-notify` forces them off for a single run. On Windows, toasts identify as **WB-300** via a
+per-user registry entry registered at startup (no admin needed); if that registration fails they
+fall back to displaying as "Windows PowerShell".
 
 ## Headless JSON for orchestrating agents
 
 `wb300 agent` prints the full repository state as JSON and exits — no TUI — so another agent
-(Claude, Codex, a script) can get an instant, structured view of the worktree / branch /
-workbranch / running-agent / collision picture:
+(Claude, Codex, a script) can get an instant, structured view of the branch hierarchy, the
+agents on it, and the files in flight:
 
 ```sh
-wb300 agent | jq '.repo.worktrees[] | {branch, workbranch, agent: .agent.name}'
+wb300 agent | jq '.repo.branches[] | {name, role, parent, lifecycle, agent: .agent.name}'
 ```
 
-The output carries a stable `"schema": "wb300.agent.v1"` tag and a `"mode"` of `"repo"` (the
+The output carries a stable `"schema": "wb300.agent.v2"` tag and a `"mode"` of `"repo"` (the
 current repository) or `"home"` (every active repository, machine-wide — used automatically
-outside a repo, or with `--home`). stdout is **pure JSON**: diagnostics and errors go to
-stderr, so the stream is always safe to parse.
+outside a repo, or with `--home`). Each repo's `branches` array is the hierarchy in depth-first
+order with `parent` pointers, plus the path-level `worktrees` and `collisions` views. stdout is
+**pure JSON**: diagnostics and errors go to stderr, so the stream is always safe to parse.
 
 ## Keybindings
 
 ```txt
-q / Esc   quit / close overlay      Tab / Shift+Tab   next / previous tab
-?         help                      1 – 7             jump to a tab
-j / k     move selection            r                 refresh snapshot
-/         filter worktrees          f                 fetch from remotes (never automatic)
-:         command palette           x                 remove selected worktree (type-to-confirm)
-K         kill agent / process      p                 prune stale worktree metadata (confirm)
+q / Esc   quit / back out            Tab / 1 – 6      switch tab
+?         help overlay               j / k            move selection
+l / h     expand / collapse          Enter            toggle node (home: open repo)
+a         active-only ⇄ all branches r                refresh snapshot
+/         filter branches            f                fetch from remotes (never automatic)
+:         command palette            x                remove selected branch's worktree (confirm)
+K         kill agent / process       p                prune stale worktree metadata (confirm)
 ```
 
-(The full, configurable keybinding set lands with the config subsystem.)
+`wb300 help` explains every view, stage, and glyph in detail.
 
-## Self-update
+## Self-update & uninstall
 
 ```sh
-wb300 update          # update in place to the latest release
-wb300 update --json   # machine-readable result (for orchestrating agents)
+wb300 update            # update in place to the latest release
+wb300 update --json     # machine-readable result (for orchestrating agents)
+wb300 uninstall         # remove wb300 via the channel that installed it
+wb300 uninstall --purge # … and remove state, config, and registry entries too
 ```
 
 `wb300 update` checks the GitHub releases API and updates in place via `cargo install` or the
@@ -183,7 +237,9 @@ prebuilt installers. On Windows it is **registry-aware**: the four first-class i
 record an install marker (`HKCU\Software\WB300\InstallSource`), and `update` downloads the
 *matching* installer, verifies its SHA-256 against the published sidecar, runs it, and confirms
 the new `--version` — so a perUser Corporate install upgrades without ever prompting for admin.
-See `CLAUDE.md` for the maintenance contract (the installer ⇄ `src/update.rs` lockstep).
+`wb300 uninstall` uses the same detection to run the matching uninstaller (or `cargo
+uninstall`), and never touches your repositories. See `CLAUDE.md` for the maintenance contract
+(the installer ⇄ `src/update.rs` lockstep).
 
 ## Development
 
@@ -194,8 +250,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Architecture notes live in `CLAUDE.md` and `docs/`. Part of the **QubeTX** line (TR-300,
-ND-300, SD-300); it shares their license, packaging, and tag-triggered release cycle.
+Architecture notes live in `CLAUDE.md` and `docs/` (the v2 design is
+`docs/WB-300_V2_DESIGN.md`). Part of the **QubeTX** line (TR-300, ND-300, SD-300); it shares
+their license, packaging, and tag-triggered release cycle.
 
 ## License
 
