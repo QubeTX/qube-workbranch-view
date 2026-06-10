@@ -12,5 +12,5 @@ pub mod snapshot;
 pub mod state;
 
 pub use discovery::{HomeConfig, home_state_dir};
-pub use snapshot::{HomeSnapshot, repo_name, workbranch_label};
+pub use snapshot::{HomeSnapshot, repo_name};
 pub use state::HomeState;
