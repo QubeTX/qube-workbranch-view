@@ -3,7 +3,7 @@
 //! With `-z`, each attribute is NUL-terminated and records are separated by an
 //! empty (NUL-only) entry, so paths containing spaces or newlines are safe.
 
-use super::status::WorktreeStatus;
+use super::status::{FileChange, WorktreeStatus};
 
 /// One worktree as reported by `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -21,9 +21,11 @@ pub struct WorktreeRecord {
     /// Working-tree status — `None` until filled by snapshot capture (the
     /// porcelain parser leaves it unset).
     pub status: Option<WorktreeStatus>,
-    /// Files this worktree has touched (working-tree changes + committed since
-    /// base) — filled by snapshot capture; drives collision detection.
-    pub touched: Vec<String>,
+    /// Files this worktree has touched (working-tree changes — untracked
+    /// included — plus files committed since base), each with its change kind.
+    /// Filled by snapshot capture; drives collision detection and per-branch
+    /// file lists. Sorted by path, de-duplicated (working-tree kind wins).
+    pub touched: Vec<FileChange>,
 }
 
 impl WorktreeRecord {

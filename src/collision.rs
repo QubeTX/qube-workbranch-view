@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use crate::git::WorktreeRecord;
+use crate::git::{ChangeKind, WorktreeRecord};
 
 /// How risky a colliding path is. Ordered so `Critical` is greatest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -94,7 +94,13 @@ pub fn compute(worktrees: &[WorktreeRecord]) -> Vec<Collision> {
     let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (idx, wt) in worktrees.iter().enumerate() {
         for file in &wt.touched {
-            by_file.entry(file.as_str()).or_default().push(idx);
+            // Untracked files are not collision material: they aren't on any
+            // branch yet, so they can't conflict at merge (matches the old
+            // touched_files behavior, which never saw untracked paths).
+            if file.kind == ChangeKind::Untracked {
+                continue;
+            }
+            by_file.entry(file.path.as_str()).or_default().push(idx);
         }
     }
 
@@ -128,10 +134,18 @@ pub fn count_for_worktree(collisions: &[Collision], idx: usize) -> usize {
 mod tests {
     use super::*;
 
+    use crate::git::FileChange;
+
     fn wt(path: &str, touched: &[&str]) -> WorktreeRecord {
         WorktreeRecord {
             path: path.to_string(),
-            touched: touched.iter().map(|s| s.to_string()).collect(),
+            touched: touched
+                .iter()
+                .map(|s| FileChange {
+                    path: s.to_string(),
+                    kind: ChangeKind::Modified,
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -167,6 +181,22 @@ mod tests {
             classify_severity("prisma/app.schema.prisma"),
             Severity::Medium
         );
+    }
+
+    #[test]
+    fn untracked_files_do_not_collide() {
+        // The same brand-new file in two worktrees isn't a merge risk — it's
+        // not on either branch yet.
+        let make = |path: &str| WorktreeRecord {
+            path: path.to_string(),
+            touched: vec![FileChange {
+                path: "scratch.rs".to_string(),
+                kind: ChangeKind::Untracked,
+            }],
+            ..Default::default()
+        };
+        let worktrees = vec![make("/a"), make("/b")];
+        assert!(compute(&worktrees).is_empty());
     }
 
     #[test]

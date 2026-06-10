@@ -4,6 +4,39 @@
 //! With `-z`, every record is NUL-terminated, and rename/copy (`2`) records are
 //! followed by an extra NUL-terminated original-path field that must be consumed.
 
+/// What kind of change a path carries. For renames/copies the NEW path is the
+/// one reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+    Conflicted,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Modified => "modified",
+            ChangeKind::Added => "added",
+            ChangeKind::Deleted => "deleted",
+            ChangeKind::Renamed => "renamed",
+            ChangeKind::Untracked => "untracked",
+            ChangeKind::Conflicted => "conflicted",
+        }
+    }
+}
+
+/// One changed path and how it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// Repo-relative path (the new path for renames/copies).
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
 /// Per-worktree working-tree status.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorktreeStatus {
@@ -19,6 +52,9 @@ pub struct WorktreeStatus {
     pub upstream_gone: bool,
     /// Current branch from the status header (`None` when detached).
     pub branch_head: Option<String>,
+    /// Every changed path with its change kind (untracked included), in the
+    /// order git reported them.
+    pub changes: Vec<FileChange>,
 }
 
 /// Parse `git status --porcelain=v2 --branch -z` output.
@@ -39,14 +75,47 @@ pub fn parse_status_v2(bytes: &[u8]) -> WorktreeStatus {
             continue;
         }
         match entry.as_bytes()[0] {
-            b'1' => count_xy(entry, &mut s),
+            b'1' => {
+                count_xy(entry, &mut s);
+                // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>` — 8 fields, then path.
+                if let Some(path) = path_after_fields(entry, 8) {
+                    s.changes.push(FileChange {
+                        path: path.to_string(),
+                        kind: xy_kind(entry),
+                    });
+                }
+            }
             b'2' => {
                 count_xy(entry, &mut s);
+                // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>` — 9 fields.
+                if let Some(path) = path_after_fields(entry, 9) {
+                    s.changes.push(FileChange {
+                        path: path.to_string(),
+                        kind: ChangeKind::Renamed,
+                    });
+                }
                 // The rename/copy original path is its own NUL-terminated field.
                 let _ = it.next();
             }
-            b'u' => s.conflicted += 1,
-            b'?' => s.untracked += 1,
+            b'u' => {
+                s.conflicted += 1;
+                // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>` — 10 fields.
+                if let Some(path) = path_after_fields(entry, 10) {
+                    s.changes.push(FileChange {
+                        path: path.to_string(),
+                        kind: ChangeKind::Conflicted,
+                    });
+                }
+            }
+            b'?' => {
+                s.untracked += 1;
+                if let Some(path) = entry.strip_prefix("? ") {
+                    s.changes.push(FileChange {
+                        path: path.to_string(),
+                        kind: ChangeKind::Untracked,
+                    });
+                }
+            }
             b'!' => {} // ignored paths
             _ => {}
         }
@@ -72,6 +141,28 @@ fn parse_header(header: &str, s: &mut WorktreeStatus, had_ab: &mut bool) {
                 s.behind = n.parse().ok();
             }
         }
+    }
+}
+
+/// The path field of a porcelain record: everything after `skip` space-separated
+/// fields. Paths may contain spaces, so only the leading fields are split off.
+fn path_after_fields(entry: &str, skip: usize) -> Option<&str> {
+    entry.splitn(skip + 1, ' ').nth(skip)
+}
+
+/// Change kind from the two-char XY of a `1` record: the staged (X) side wins
+/// when both sides changed, mapping A→added, D→deleted, anything else→modified.
+fn xy_kind(entry: &str) -> ChangeKind {
+    let xy = entry.split(' ').nth(1).unwrap_or("..");
+    let mut chars = xy.chars();
+    let x = chars.next().unwrap_or('.');
+    let y = chars.next().unwrap_or('.');
+    let significant = if x != '.' { x } else { y };
+    match significant {
+        'A' => ChangeKind::Added,
+        'D' => ChangeKind::Deleted,
+        'R' | 'C' => ChangeKind::Renamed,
+        _ => ChangeKind::Modified, // M, T, and anything else
     }
 }
 
@@ -185,5 +276,48 @@ mod tests {
         let bytes = fixture(&["# branch.oid abc", "# branch.head (detached)"]);
         let s = parse_status_v2(&bytes);
         assert_eq!(s.branch_head, None);
+    }
+
+    #[test]
+    fn extracts_per_file_changes_with_kinds() {
+        let bytes = fixture(&[
+            "# branch.head feature/x",
+            "1 M. N... 100644 100644 100644 aaa bbb src/modified.rs",
+            "1 A. N... 000000 100644 100644 aaa bbb src/added.rs",
+            "1 .D N... 100644 100644 100644 aaa bbb src/deleted.rs",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 src/new_name.rs",
+            "src/old_name.rs",
+            "u UU N... 1 2 3 4 aaa bbb ccc src/conflict.rs",
+            "? brand_new.rs",
+        ]);
+        let s = parse_status_v2(&bytes);
+        let by_path: Vec<(&str, ChangeKind)> = s
+            .changes
+            .iter()
+            .map(|f| (f.path.as_str(), f.kind))
+            .collect();
+        assert_eq!(
+            by_path,
+            vec![
+                ("src/modified.rs", ChangeKind::Modified),
+                ("src/added.rs", ChangeKind::Added),
+                ("src/deleted.rs", ChangeKind::Deleted),
+                ("src/new_name.rs", ChangeKind::Renamed),
+                ("src/conflict.rs", ChangeKind::Conflicted),
+                ("brand_new.rs", ChangeKind::Untracked),
+            ]
+        );
+    }
+
+    #[test]
+    fn change_paths_with_spaces_survive() {
+        let bytes = fixture(&[
+            "# branch.head main",
+            "1 M. N... 100644 100644 100644 aaa bbb src/my file with spaces.rs",
+            "? another spaced file.txt",
+        ]);
+        let s = parse_status_v2(&bytes);
+        assert_eq!(s.changes[0].path, "src/my file with spaces.rs");
+        assert_eq!(s.changes[1].path, "another spaced file.txt");
     }
 }
