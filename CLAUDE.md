@@ -4,18 +4,25 @@ Guidance for Claude Code (and any agent) working in this repository.
 
 ## Project overview
 
-WB-300 (`wb300`) is a cross-platform Rust **TUI operator console** for supervising many
-parallel coding-agent workspaces through Git worktrees. It runs inside a Git repo and shows
-branches, worktrees, dirty/clean status, the OS processes running inside each worktree
-(Claude / Codex / builds / tests), changed-file collisions, remote drift, and safe-cleanup
-candidates. Run outside a repo, it opens a machine-wide view of every repo being worked on.
+WB-300 (`wb300`) is a cross-platform Rust **TUI operator console** for supervising parallel
+coding-agent work in Git. **The model (v2): one agent = one branch = one worktree** — Git
+allows a branch to be checked out in at most ONE worktree, so the primary view is the real
+**branch hierarchy** (trunk → daily workbranch → task branches, derived from commit topology,
+never from name prefixes), with each branch carrying its lifecycle stage
+(editing/uncommitted/committed/pushed/merged), its agent process, its ⌂ worktree, and the
+files in flight. It also maps OS processes (Claude / Codex / builds / tests), forecasts
+merge-conflict risk, records a timeline, sends OS toast notifications (commit / push /
+conflict-risk only), and scores safe cleanup. Run outside a repo, it shows one unified tree
+over every active repository on the machine.
 
 - **Crate + binary:** `wb300` (lowercase, no hyphen).
-- **Stack:** Rust (edition 2024) + Ratatui + Crossterm + Tokio + notify + sysinfo, driving the
-  installed `git` CLI via async subprocesses (no `git2`/`gix` in v1).
+- **Stack:** Rust (edition 2024) + Ratatui + Crossterm + Tokio + notify + sysinfo +
+  notify-rust (toasts) + toml (config), driving the installed `git` CLI via async
+  subprocesses (no `git2`/`gix`).
 - **Part of the QubeTX line** (TR-300, ND-300, SD-300). License, packaging, and the
   build/deploy cycle mirror TR-300 (see "Deploy a new version" below).
-- **Design source of truth:** `docs/WB-300_HANDOFF_PLAN.md`.
+- **Design source of truth:** `docs/WB-300_V2_DESIGN.md` (the corrected model).
+  `docs/WB-300_HANDOFF_PLAN.md` is the v1 historical record — where they conflict, V2 wins.
 
 ## Architecture (the one rule that matters)
 
@@ -35,9 +42,14 @@ KeyEvent → resolve_key → Action → AppState::apply (reducer)
 - **Terminal restoration is unconditional** — `terminal::TerminalGuard` (RAII) + the panic hook
   from `terminal::install_panic_hook` restore raw mode / the alternate screen on every exit.
 
-Module layout: `app/` (state, action, reducer), `terminal/` (guard + panic hook), `ui/`
-(render + theme), and — added phase by phase — `git/`, `live/`, `process/`, `config/`,
-`storage/`, `update.rs`.
+Module layout: `app/` (state, action, reducer, `tree.rs` — tree state + flatten), `git/`
+(snapshot pipeline, `hierarchy.rs` — topology-derived branch tree, `lifecycle.rs` — the
+per-branch stage table), `ui/` (per-tab modules: `branches`/`tree` render the hierarchy;
+`processes`, `merge_risk`, `cleanup`, `timeline`, `overlays`, `home`), `live/` (watcher +
+debouncer), `process/` (scan + classify), `storage/` (events.jsonl), `notifications.rs`
+(toast policy + backends), `config.rs` (minimal TOML), `help.rs` (the `wb300 help` manual —
+keep it in sync with UI changes), `uninstall.rs`, `update.rs`, `terminal/` (guard + panic
+hook).
 
 ## Build & run
 
@@ -159,9 +171,17 @@ matching installer (SHA-256-verified) on Windows, or `cargo` / shell installer e
 **Lockstep contract:** the install paths and `HKCU\Software\WB300\InstallSource` marker values
 in `wix/main.wxs`, `wix-corporate/corporate.wxs`, `inno/global.iss`, and `inno/corporate.iss`
 must change **together with** `src/update.rs::detect_install_origin()` (and its
-`read_install_source_marker` arms) in the same commit. The four edition values are
-`msi-global` / `msi-corporate` / `exe-global` / `exe-corporate`. Product GUIDs (MSI
-`UpgradeCode`s, Inno `AppId`s) are **permanent** — regenerating them breaks in-place upgrades.
+`read_install_source_marker` arms) in the same commit. `src/uninstall.rs` consumes the same
+origin detection and the installers' Add/Remove entries — keep it in the same lockstep. The
+four edition values are `msi-global` / `msi-corporate` / `exe-global` / `exe-corporate`.
+Product GUIDs (MSI `UpgradeCode`s, Inno `AppId`s) are **permanent** — regenerating them breaks
+in-place upgrades.
+
+**Toast AUMID (future lockstep item):** notifications self-register the
+`HKCU\Software\Classes\AppUserModelId\QubeTX.WB300` key at runtime
+(`src/notifications.rs::register_aumid`). If/when the four installers take ownership of that
+registration (plus a toast icon), change the installers AND `register_aumid` AND
+`uninstall.rs::purge_windows` together — same lockstep discipline as `InstallSource`.
 
 ## Git workflow
 

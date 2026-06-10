@@ -24,6 +24,14 @@ pub enum Action {
     MoveDown,
     /// Move the selection up within the current list.
     MoveUp,
+    /// Expand the selected tree node (or step into its first child).
+    Expand,
+    /// Collapse the selected tree node (or jump to its parent).
+    Collapse,
+    /// Toggle expansion of the selected tree node.
+    ToggleExpand,
+    /// Toggle between active-only and all branches in the tree.
+    ToggleShowAll,
     /// Re-capture the repository snapshot.
     Refresh,
     /// Fetch from remotes (`git fetch --all --prune`).

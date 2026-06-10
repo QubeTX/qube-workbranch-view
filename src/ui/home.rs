@@ -1,18 +1,18 @@
-//! Rendering for the machine-wide home view. Like `ui::render`, this never runs
-//! Git or mutates state — it reads [`HomeState`] and draws.
+//! Rendering for the machine-wide home view: one branch tree across every
+//! active repository, with repo nodes at the root. Like `ui::render`, this
+//! never runs Git or mutates state — it reads [`HomeState`] and draws.
 
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListState, Paragraph, Wrap},
 };
 
 use super::theme;
 use crate::app::LiveStatus;
-use crate::git::{RepoSnapshot, WorktreeRecord, WorktreeStatus};
-use crate::home::{HomeState, repo_name, workbranch_label};
+use crate::home::HomeState;
 
 /// Render the whole home view for the current frame.
 pub fn render(frame: &mut Frame, home: &HomeState) {
@@ -49,7 +49,7 @@ fn render_header(frame: &mut Frame, area: Rect, home: &HomeState) {
         live_indicator(home.live),
         Span::from(scanned).fg(theme::DIM),
     ]);
-    let summary = Line::from(vec![
+    let mut summary = vec![
         Span::from(format!("{} ", home.repo_count()))
             .bold()
             .fg(theme::ACCENT),
@@ -59,9 +59,14 @@ fn render_header(frame: &mut Frame, area: Rect, home: &HomeState) {
         Span::from(format!("{} ", home.snapshot.total_active()))
             .bold()
             .fg(theme::CLEAN),
-        Span::from("with a live agent").fg(theme::DIM),
-    ]);
-    let p = Paragraph::new(summary).block(Block::bordered().title(title));
+        Span::from("with a live agent   ").fg(theme::DIM),
+    ];
+    if home.tree.show_all {
+        summary.push(Span::from("showing all branches").fg(theme::ACCENT));
+    } else {
+        summary.push(Span::from("active branches only (a for all)").fg(theme::DIM));
+    }
+    let p = Paragraph::new(Line::from(summary)).block(Block::bordered().title(title));
     frame.render_widget(p, area);
 }
 
@@ -75,158 +80,25 @@ fn live_indicator(status: LiveStatus) -> Span<'static> {
 
 fn render_body(frame: &mut Frame, area: Rect, home: &HomeState) {
     let [list_area, detail_area] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
 
-    render_repo_list(frame, list_area, home);
-    render_repo_detail(frame, detail_area, home);
-}
+    let rows = home.tree_rows();
+    let inner_width = list_area.width.saturating_sub(4); // borders + cursor
+    let items = super::tree::tree_items(&rows, &|key| home.transitions.get(key), inner_width);
 
-fn render_repo_list(frame: &mut Frame, area: Rect, home: &HomeState) {
-    let items: Vec<ListItem> = home
-        .snapshot
-        .repos
-        .iter()
-        .map(|repo| {
-            let active = active_count(repo);
-            let dirty = dirty_count(repo);
-            let mut spans = vec![Span::from(repo_name(repo)).bold()];
-            spans.push(Span::from(format!("  {} wt", repo.worktrees.len())).fg(theme::DIM));
-            if active > 0 {
-                spans.push(Span::from(format!("  ● {active}")).fg(theme::CLEAN));
-            }
-            if dirty > 0 {
-                spans.push(Span::from(format!("  ✎ {dirty}")).fg(theme::DIRTY));
-            }
-            if !repo.collisions.is_empty() {
-                spans.push(
-                    Span::from(format!("  ⚠ {}", repo.collisions.len())).fg(theme::COLLISION),
-                );
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+    let mut state = ListState::default();
+    state.select(home.tree.selected_index(&rows));
 
     let list = List::new(items)
-        .block(Block::bordered().title(" Repos "))
-        .highlight_style(Style::new().bold().fg(theme::ACCENT))
-        .highlight_symbol("▌ ");
-    let mut state = ListState::default();
-    state.select(Some(home.selected));
-    frame.render_stateful_widget(list, area, &mut state);
-}
+        .block(Block::bordered().title(" Every repo · every branch · every agent "))
+        // Bold + the ▸ cursor mark the selection WITHOUT overriding the row's
+        // own foreground, so flashes and the uncommitted-yellow stay visible.
+        .highlight_style(Style::new().bold())
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, list_area, &mut state);
 
-fn render_repo_detail(frame: &mut Frame, area: Rect, home: &HomeState) {
-    let Some(repo) = home.selected_repo() else {
-        return;
-    };
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::from("repo  ").fg(theme::DIM),
-            Span::from(repo_name(repo)).bold(),
-        ]),
-        Line::from(Span::from(repo.repo.root.display().to_string()).fg(theme::DIM)),
-        Line::from(""),
-    ];
-
-    // Group worktrees by their (heuristic) workbranch, preserving first-seen
-    // group order. Each entry keeps the worktree's original index so agent /
-    // collision lookups against the snapshot stay correct.
-    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-    for (idx, wt) in repo.worktrees.iter().enumerate() {
-        if wt.bare {
-            continue;
-        }
-        let label = workbranch_label(wt.branch_short());
-        match groups.iter_mut().find(|(g, _)| *g == label) {
-            Some((_, v)) => v.push(idx),
-            None => groups.push((label, vec![idx])),
-        }
-    }
-
-    if groups.is_empty() {
-        lines.push(Line::from(Span::from("(no worktrees)").fg(theme::DIM)));
-    }
-
-    for (label, indices) in groups {
-        lines.push(Line::from(
-            Span::from(format!("▸ {label}")).bold().fg(theme::ACCENT),
-        ));
-        for idx in indices {
-            lines.push(worktree_line(home, repo, idx));
-        }
-        lines.push(Line::from(""));
-    }
-
-    let p = Paragraph::new(lines)
-        .block(Block::bordered().title(" Worktrees by workbranch "))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(p, area);
-}
-
-/// One worktree row: a leading live-activity dot (its own colour), then the body
-/// — branch, agent badge, status badges, collision marker — which takes the
-/// persistent state colour (whole-line yellow while uncommitted) or a milestone
-/// flash colour (magenta committed / green pushed) over the entire row.
-fn worktree_line(home: &HomeState, repo: &RepoSnapshot, idx: usize) -> Line<'static> {
-    let wt = &repo.worktrees[idx];
-    let transition = home.transition_for(&wt.path);
-
-    let mut body = vec![Span::from(wt.display_name())];
-    if let Some(agent) = repo.processes.agent_for_worktree(idx) {
-        body.push(Span::from(format!("  ● {} pid {}", agent.name, agent.pid)).fg(theme::CLEAN));
-    }
-    body.extend(status_badges(wt.status.as_ref()));
-    let collisions = repo
-        .collisions
-        .iter()
-        .filter(|c| c.worktrees.contains(&idx))
-        .count();
-    if collisions > 0 {
-        body.push(Span::from(format!("  ⚠ {collisions}")).fg(theme::COLLISION));
-    }
-
-    let dot = super::activity_dot(transition);
-
-    // A commit/push milestone, OR uncommitted state, recolors the ENTIRE row —
-    // dot included — so an actively-edited uncommitted worktree is all yellow.
-    // Milestone flashes take precedence.
-    let line_color =
-        super::milestone_color(transition).or_else(|| super::uncommitted_color(wt.status.as_ref()));
-    if let Some(color) = line_color {
-        let recolored: Vec<Span> = std::iter::once(dot)
-            .chain(body)
-            .map(|s| s.fg(color))
-            .collect();
-        return Line::from(recolored);
-    }
-    // Clean: the dot keeps its own live colour (blue ◆ while editing, dim · idle).
-    let mut spans = vec![dot];
-    spans.extend(body);
-    Line::from(spans)
-}
-
-fn status_badges(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let Some(s) = status else {
-        return spans;
-    };
-    if s.clean {
-        spans.push(Span::from("  clean").fg(theme::DIM));
-    } else {
-        let dirty = s.staged + s.unstaged + s.untracked + s.conflicted;
-        spans.push(Span::from(format!("  ✎ {dirty}")).fg(theme::DIRTY));
-    }
-    if let Some(ahead) = s.ahead.filter(|&a| a > 0) {
-        spans.push(Span::from(format!("  ↑{ahead}")).fg(theme::CLEAN));
-    }
-    if let Some(behind) = s.behind.filter(|&b| b > 0) {
-        spans.push(Span::from(format!("  ↓{behind}")).fg(theme::DIRTY));
-    }
-    if s.upstream_gone {
-        spans.push(Span::from("  upstream-gone").fg(theme::COLLISION));
-    }
-    spans
+    let selected = home.tree.selected_index(&rows).and_then(|i| rows.get(i));
+    super::branches::render_details(frame, detail_area, &home.snapshot.repos, selected);
 }
 
 fn render_empty(frame: &mut Frame, area: Rect) {
@@ -257,7 +129,11 @@ fn render_empty(frame: &mut Frame, area: Rect) {
 fn render_footer(frame: &mut Frame, area: Rect) {
     let hint = Line::from(vec![
         Span::from(" j/k ").fg(theme::ACCENT),
-        Span::from("select  ").fg(theme::DIM),
+        Span::from("move  ").fg(theme::DIM),
+        Span::from("h/l ").fg(theme::ACCENT),
+        Span::from("fold  ").fg(theme::DIM),
+        Span::from("a ").fg(theme::ACCENT),
+        Span::from("active/all  ").fg(theme::DIM),
         Span::from("Enter ").fg(theme::ACCENT),
         Span::from("open repo  ").fg(theme::DIM),
         Span::from("r ").fg(theme::ACCENT),
@@ -274,17 +150,29 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::from("WB-300 — Home view").bold().fg(theme::ACCENT)),
         Line::from(""),
-        Line::from("A machine-wide control tower over every repository being actively"),
-        Line::from("worked on: those with a running agent, plus parallel-work repos under"),
-        Line::from("your code-home directories. Each card breaks a repo down by workbranch."),
+        Line::from("One tree across every repository being actively worked on: each"),
+        Line::from("repo's branch hierarchy (main → workbranch → task branches), the"),
+        Line::from("agent on each branch, and the files being changed."),
         Line::from(""),
         Line::from(vec![
             Span::from("  j / k        ").fg(theme::ACCENT),
-            Span::from("move between repositories").fg(theme::DIM),
+            Span::from("move through the tree").fg(theme::DIM),
+        ]),
+        Line::from(vec![
+            Span::from("  l / h        ").fg(theme::ACCENT),
+            Span::from("expand / collapse a node").fg(theme::DIM),
+        ]),
+        Line::from(vec![
+            Span::from("  Space        ").fg(theme::ACCENT),
+            Span::from("toggle expansion").fg(theme::DIM),
+        ]),
+        Line::from(vec![
+            Span::from("  a            ").fg(theme::ACCENT),
+            Span::from("active branches only / all branches").fg(theme::DIM),
         ]),
         Line::from(vec![
             Span::from("  Enter        ").fg(theme::ACCENT),
-            Span::from("open the selected repo's full view").fg(theme::DIM),
+            Span::from("open the selected repo's full view (actions live there)").fg(theme::DIM),
         ]),
         Line::from(vec![
             Span::from("  r            ").fg(theme::ACCENT),
@@ -300,7 +188,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(
-            Span::from("Live: ◆ a file is being saved (blue when clean) · the whole line is yellow while uncommitted.")
+            Span::from("Live: ◆ a file is being saved · the whole line is yellow while uncommitted.")
                 .fg(theme::DIM),
         ),
         Line::from(
@@ -308,25 +196,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 .fg(theme::DIM),
         ),
     ];
-    let popup = centered_rect(72, 70, area);
+    let popup = centered_rect(72, 75, area);
     frame.render_widget(Clear, popup);
     let p = Paragraph::new(lines)
         .block(Block::bordered().title(" Help "))
         .wrap(Wrap { trim: true });
     frame.render_widget(p, popup);
-}
-
-fn active_count(repo: &RepoSnapshot) -> usize {
-    (0..repo.worktrees.len())
-        .filter(|&i| repo.processes.worktree_is_active(i))
-        .count()
-}
-
-fn dirty_count(repo: &RepoSnapshot) -> usize {
-    repo.worktrees
-        .iter()
-        .filter(|wt: &&WorktreeRecord| wt.status.as_ref().is_some_and(|s| !s.clean))
-        .count()
 }
 
 /// A coarse human-readable duration (matches the per-repo header style).

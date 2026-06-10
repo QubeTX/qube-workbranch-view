@@ -1,22 +1,30 @@
 //! `wb300 agent` — the headless JSON snapshot.
 //!
 //! Emits the full repo (or machine-wide) state as JSON so an orchestrating
-//! agent (Claude / Codex / a script) can get an instant, structured view of the
-//! worktree/branch/workbranch/agent/collision picture without driving the TUI.
+//! agent (Claude / Codex / a script) can get an instant, structured view of
+//! the branch hierarchy — trunk → workbranch → task branches, each with its
+//! lifecycle stage, worktree, attached agent, and changed files — plus the
+//! worktree-level and collision views, without driving the TUI.
 //!
-//! The structs here form a **stable JSON contract** (`schema: "wb300.agent.v1"`)
+//! The structs here form a **stable JSON contract** (`schema: "wb300.agent.v2"`)
 //! that is deliberately decoupled from the internal data models, so refactors
-//! to `RepoSnapshot`/`WorktreeRecord` don't silently break downstream consumers.
+//! to `RepoSnapshot`/`WorktreeRecord` don't silently break downstream
+//! consumers. v2 replaced v1's name-prefix "workbranch" grouping with the real
+//! branch hierarchy (`branches`, depth-first with parent pointers).
 
 use serde::Serialize;
 
 use crate::collision::Collision;
-use crate::git::{RepoSnapshot, WorktreeRecord};
-use crate::home::{repo_name, workbranch_label};
+use crate::git::{BranchNode, RepoSnapshot, WorktreeRecord};
+use crate::home::repo_name;
 use crate::process::ProcessInfo;
 
 /// The schema identifier emitted with every report; bump on a breaking change.
-const SCHEMA: &str = "wb300.agent.v1";
+const SCHEMA: &str = "wb300.agent.v2";
+
+/// Cap on the per-branch changed-file list in the report; `files_total`
+/// always carries the real count.
+pub const MAX_REPORT_FILES: usize = 50;
 
 /// Top-level `wb300 agent` output.
 #[derive(Debug, Serialize)]
@@ -77,14 +85,22 @@ pub struct RepoReport {
     pub common_git_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Local short name of the recognized trunk branch, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trunk: Option<String>,
+    /// True when branch parentage degraded (topology walk failed/capped).
+    pub hierarchy_approximate: bool,
     pub local_branches: usize,
     pub remote_branches: usize,
     pub worktree_count: usize,
     /// Worktrees currently running an agent.
     pub active_count: usize,
+    /// The branch hierarchy in depth-first order (trunk first, each branch
+    /// followed by its subtree) — reads as a tree top-to-bottom; rebuild the
+    /// nesting from `parent` pointers.
+    pub branches: Vec<BranchReport>,
+    /// The path-level view: every worktree on disk (incl. detached/bare).
     pub worktrees: Vec<WorktreeReport>,
-    /// Worktrees grouped by their (heuristic) workbranch.
-    pub workbranches: Vec<WorkbranchGroup>,
     pub collisions: Vec<CollisionReport>,
 }
 
@@ -97,22 +113,12 @@ impl RepoReport {
             .map(|(idx, wt)| WorktreeReport::from_record(snap, idx, wt))
             .collect();
 
-        // Group worktree display names by workbranch, preserving first-seen order.
-        let mut workbranches: Vec<WorkbranchGroup> = Vec::new();
-        for wt in &snap.worktrees {
-            if wt.bare {
-                continue;
-            }
-            let label = workbranch_label(wt.branch_short());
-            let name = wt.display_name();
-            match workbranches.iter_mut().find(|g| g.workbranch == label) {
-                Some(group) => group.worktrees.push(name),
-                None => workbranches.push(WorkbranchGroup {
-                    workbranch: label,
-                    worktrees: vec![name],
-                }),
-            }
-        }
+        let branches: Vec<BranchReport> = snap
+            .hierarchy
+            .nodes
+            .iter()
+            .map(|n| BranchReport::from_node(snap, n))
+            .collect();
 
         let active_count = (0..snap.worktrees.len())
             .filter(|&i| snap.processes.worktree_is_active(i))
@@ -123,12 +129,14 @@ impl RepoReport {
             root: snap.repo.root.display().to_string(),
             common_git_dir: snap.repo.common_git_dir.display().to_string(),
             base: snap.base.clone(),
+            trunk: snap.hierarchy.trunk.clone(),
+            hierarchy_approximate: snap.hierarchy.approximate,
             local_branches: snap.local_branch_count(),
             remote_branches: snap.remote_branch_count(),
             worktree_count: snap.worktrees.len(),
             active_count,
+            branches,
             worktrees,
-            workbranches,
             collisions: snap
                 .collisions
                 .iter()
@@ -138,13 +146,117 @@ impl RepoReport {
     }
 }
 
+/// One branch in the hierarchy: where it sits (role/parent), where its work
+/// stands (lifecycle, ahead/behind), and what is physically attached to it
+/// (worktree, agent, changed files).
+#[derive(Debug, Serialize)]
+pub struct BranchReport {
+    /// Short name, e.g. `feat/csv-export-142`.
+    pub name: String,
+    /// `"trunk"` | `"workbranch"` | `"task"` | `"standalone"`.
+    pub role: String,
+    /// Parent branch short name; absent for trunk (or when no trunk exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    pub oid: String,
+    /// `"editing"`* | `"uncommitted"` | `"committed"` | `"pushed"` |
+    /// `"merged"` | `"fresh"`. (*never emitted by one-shot captures — live
+    /// editing state needs the running TUI's filesystem watcher.)
+    pub lifecycle: String,
+    /// Commits on this branch not reachable from its parent.
+    pub ahead_of_parent: u32,
+    /// Commits on the parent not on this branch ("needs rebase" when > 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind_parent: Option<u32>,
+    pub merged_into_parent: bool,
+    /// Whether the branch matters right now: a worktree, unmerged/unpushed
+    /// work, or an active descendant (trunk is always active).
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u32>,
+    pub upstream_gone: bool,
+    /// Path of the worktree where this branch is checked out, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// The primary coding agent running in this branch's worktree, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ProcReport>,
+    /// Changed files (working tree + committed since base), capped at
+    /// [`MAX_REPORT_FILES`]; `files_total` is the uncapped count.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileReport>,
+    pub files_total: usize,
+    /// Number of merge-conflict risks this branch's worktree participates in.
+    pub collisions: usize,
+}
+
+impl BranchReport {
+    fn from_node(snap: &RepoSnapshot, node: &BranchNode) -> Self {
+        let wt = node.worktree.and_then(|i| snap.worktrees.get(i));
+        let files: Vec<FileReport> = wt
+            .map(|w| {
+                w.touched
+                    .iter()
+                    .take(MAX_REPORT_FILES)
+                    .map(|f| FileReport {
+                        path: f.path.clone(),
+                        kind: f.kind.as_str().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let files_total = wt.map_or(0, |w| w.touched.len());
+        let collisions = node.worktree.map_or(0, |i| {
+            crate::collision::count_for_worktree(&snap.collisions, i)
+        });
+        let agent = node
+            .worktree
+            .and_then(|i| snap.processes.agent_for_worktree(i))
+            .map(ProcReport::from_info);
+
+        Self {
+            name: node.name.clone(),
+            role: node.role.as_str().to_string(),
+            parent: node.parent.clone(),
+            oid: node.oid.clone(),
+            lifecycle: node.lifecycle.as_str().to_string(),
+            ahead_of_parent: node.ahead_of_parent,
+            behind_parent: node.behind_parent,
+            merged_into_parent: node.merged_into_parent,
+            active: snap.hierarchy.is_active(node),
+            upstream: node.upstream.clone(),
+            ahead: node.ahead,
+            behind: node.behind,
+            upstream_gone: node.upstream_gone,
+            worktree: wt.map(|w| w.path.clone()),
+            agent,
+            files,
+            files_total,
+            collisions,
+        }
+    }
+}
+
+/// One changed file under a branch.
+#[derive(Debug, Serialize)]
+pub struct FileReport {
+    /// Repo-relative path.
+    pub path: String,
+    /// `"modified"` | `"added"` | `"deleted"` | `"renamed"` | `"untracked"` |
+    /// `"conflicted"`.
+    pub kind: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorktreeReport {
     pub path: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    pub workbranch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
     pub detached: bool,
@@ -185,7 +297,6 @@ impl WorktreeReport {
             path: wt.path.clone(),
             name: wt.display_name(),
             branch: wt.branch_short().map(str::to_string),
-            workbranch: workbranch_label(wt.branch_short()),
             head: wt.short_head().map(str::to_string),
             detached: wt.detached,
             bare: wt.bare,
@@ -260,12 +371,6 @@ impl ProcReport {
 }
 
 #[derive(Debug, Serialize)]
-pub struct WorkbranchGroup {
-    pub workbranch: String,
-    pub worktrees: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct CollisionReport {
     pub file: String,
     pub severity: String,
@@ -290,8 +395,35 @@ impl CollisionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::{RepoIdentity, RepoSnapshot, WorktreeRecord, WorktreeStatus};
+    use crate::git::{
+        BranchHierarchy, BranchLifecycle, BranchRole, ChangeKind, FileChange, RepoIdentity,
+        RepoSnapshot, WorktreeRecord, WorktreeStatus,
+    };
     use crate::process::ProcessSnapshot;
+
+    fn node(
+        name: &str,
+        role: BranchRole,
+        parent: Option<&str>,
+        worktree: Option<usize>,
+    ) -> BranchNode {
+        BranchNode {
+            name: name.to_string(),
+            oid: format!("oid-{name}"),
+            role,
+            parent: parent.map(str::to_string),
+            ahead_of_parent: if role == BranchRole::Trunk { 0 } else { 1 },
+            behind_parent: Some(0),
+            merged_into_parent: false,
+            upstream: Some(format!("origin/{name}")),
+            ahead: Some(2),
+            behind: Some(0),
+            upstream_gone: false,
+            committer_date: None,
+            lifecycle: BranchLifecycle::Committed,
+            worktree,
+        }
+    }
 
     fn snapshot() -> RepoSnapshot {
         RepoSnapshot {
@@ -320,44 +452,99 @@ mod tests {
                         upstream: Some("origin/feat/x-1".into()),
                         ..Default::default()
                     }),
+                    touched: vec![FileChange {
+                        path: "src/x.rs".into(),
+                        kind: ChangeKind::Modified,
+                    }],
                     ..Default::default()
                 },
             ],
             branches: Vec::new(),
+            hierarchy: BranchHierarchy {
+                trunk: Some("main".into()),
+                nodes: vec![
+                    node("main", BranchRole::Trunk, None, Some(0)),
+                    node(
+                        "emmett/wb-2026-06-10",
+                        BranchRole::Workbranch,
+                        Some("main"),
+                        None,
+                    ),
+                    node(
+                        "feat/x-1",
+                        BranchRole::Task,
+                        Some("emmett/wb-2026-06-10"),
+                        Some(1),
+                    ),
+                ],
+                approximate: false,
+            },
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
     #[test]
-    fn repo_report_shapes_the_snapshot() {
+    fn repo_report_shapes_the_hierarchy() {
         let report = Report::repo(&snapshot());
         assert_eq!(report.mode, "repo");
-        assert_eq!(report.schema, "wb300.agent.v1");
+        assert_eq!(report.schema, "wb300.agent.v2");
         let repo = report.repo.as_ref().unwrap();
+        assert_eq!(repo.trunk.as_deref(), Some("main"));
+        assert!(!repo.hierarchy_approximate);
+
+        // Depth-first hierarchy with parent pointers.
+        let names: Vec<&str> = repo.branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "emmett/wb-2026-06-10", "feat/x-1"]);
+        let task = &repo.branches[2];
+        assert_eq!(task.role, "task");
+        assert_eq!(task.parent.as_deref(), Some("emmett/wb-2026-06-10"));
+        assert_eq!(task.lifecycle, "committed");
+        assert_eq!(task.worktree.as_deref(), Some("/repo-feat"));
+        assert_eq!(task.files.len(), 1);
+        assert_eq!(task.files[0].kind, "modified");
+        assert_eq!(task.files_total, 1);
+
+        // The path-level worktree view survives (without the old fake
+        // workbranch label).
         assert_eq!(repo.worktree_count, 2);
         assert_eq!(repo.worktrees[1].branch.as_deref(), Some("feat/x-1"));
-        assert_eq!(repo.worktrees[1].workbranch, "feat");
         assert_eq!(repo.worktrees[1].status.as_ref().unwrap().staged, 1);
-        // Grouped by workbranch: main, then feat.
-        let labels: Vec<&str> = repo
-            .workbranches
-            .iter()
-            .map(|g| g.workbranch.as_str())
-            .collect();
-        assert_eq!(labels, vec!["main", "feat"]);
     }
 
     #[test]
-    fn report_serializes_to_valid_json() {
+    fn report_serializes_to_valid_v2_json() {
         let json = Report::repo(&snapshot()).to_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(parsed["schema"], "wb300.agent.v1");
+        assert_eq!(parsed["schema"], "wb300.agent.v2");
         assert_eq!(parsed["mode"], "repo");
-        assert_eq!(parsed["repo"]["worktree_count"], 2);
-        // `repo` present in repo mode; `repos` is always present (empty here).
-        assert!(parsed.get("repo").is_some());
+        assert_eq!(parsed["repo"]["trunk"], "main");
+        assert_eq!(parsed["repo"]["branches"][2]["name"], "feat/x-1");
+        assert_eq!(
+            parsed["repo"]["branches"][2]["parent"],
+            "emmett/wb-2026-06-10"
+        );
+        // The v1 grouping is gone.
+        assert!(parsed["repo"].get("workbranches").is_none());
+        assert!(parsed["repo"]["worktrees"][0].get("workbranch").is_none());
+        // `repos` is always present (empty here).
         assert!(parsed["repos"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_branch_files_are_capped_with_a_real_total() {
+        let mut snap = snapshot();
+        snap.worktrees[1].touched = (0..60)
+            .map(|i| FileChange {
+                path: format!("src/f{i:02}.rs"),
+                kind: ChangeKind::Modified,
+            })
+            .collect();
+        let report = Report::repo(&snap);
+        let task = &report.repo.as_ref().unwrap().branches[2];
+        assert_eq!(task.files.len(), MAX_REPORT_FILES);
+        assert_eq!(task.files_total, 60);
     }
 
     #[test]
@@ -369,6 +556,7 @@ mod tests {
         let json = report.to_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["repos"][0]["name"], "repo");
+        assert_eq!(parsed["repos"][0]["branches"][0]["role"], "trunk");
         assert!(parsed.get("repo").is_none());
     }
 }

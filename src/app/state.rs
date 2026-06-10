@@ -10,6 +10,7 @@ use super::overlay::{
     Command, Confirm, ConfirmAction, Overlay, Palette, PendingGit, PendingKill, palette_filtered,
 };
 use super::transitions::{TransitionKind, Transitions};
+use super::tree::{NodeId, RowKind, TreeRow, TreeState, flatten, live_ids};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 use crate::storage::{ArchivedEvent, DirtySummary, EventKind};
 
@@ -19,14 +20,14 @@ const MAX_ARCHIVE: usize = 2000;
 /// How long a transient operator status message (e.g. a kill result) stays up.
 const STATUS_TTL: Duration = Duration::from_millis(5000);
 
-/// Top-level views. Mirrors the design's tab set; Timeline arrives with the
-/// event archive in a later phase (handoff §14.2).
+/// Top-level views. The Branches tree is the primary view; the old Overview
+/// counts live in the header strip and the old flat Worktrees list lives on
+/// inside the tree (worktrees are attributes of branches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    Overview,
-    Worktrees,
+    Branches,
     Processes,
-    Collisions,
+    MergeRisk,
     Cleanup,
     Timeline,
     Help,
@@ -34,11 +35,10 @@ pub enum Tab {
 
 impl Tab {
     /// All tabs, in display order.
-    pub const ALL: [Tab; 7] = [
-        Tab::Overview,
-        Tab::Worktrees,
+    pub const ALL: [Tab; 6] = [
+        Tab::Branches,
         Tab::Processes,
-        Tab::Collisions,
+        Tab::MergeRisk,
         Tab::Cleanup,
         Tab::Timeline,
         Tab::Help,
@@ -47,10 +47,9 @@ impl Tab {
     /// The short title shown in the tab bar.
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Overview => "Overview",
-            Tab::Worktrees => "Worktrees",
+            Tab::Branches => "Branches",
             Tab::Processes => "Processes",
-            Tab::Collisions => "Merge Risk",
+            Tab::MergeRisk => "Merge Risk",
             Tab::Cleanup => "Cleanup",
             Tab::Timeline => "Timeline",
             Tab::Help => "Help",
@@ -96,9 +95,9 @@ pub struct AppState {
     pub show_help: bool,
     /// The captured Git state.
     pub snapshot: RepoSnapshot,
-    /// Selected index within the worktree list.
-    pub selected: usize,
-    /// Transient highlights for live changes.
+    /// Expansion + selection state of the branch tree.
+    pub tree: TreeState,
+    /// Transient highlights for live changes (keyed by `NodeId::flash_key`).
     pub transitions: Transitions,
     /// Set by `apply(Refresh)`; consumed by the event loop to trigger a capture.
     pending_refresh: bool,
@@ -134,15 +133,32 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Create the initial state from a captured snapshot.
+    /// Create the initial state from a captured snapshot. The initial tree
+    /// selection is the branch checked out where wb300 was launched.
     pub fn new(snapshot: RepoSnapshot) -> Self {
-        let selected = snapshot.current_worktree_index().unwrap_or(0);
+        let mut tree = TreeState::default();
+        let repo = crate::home::snapshot::repo_key(&snapshot);
+        if let Some(wt) = snapshot
+            .current_worktree_index()
+            .and_then(|i| snapshot.worktrees.get(i))
+        {
+            tree.selected = Some(match wt.branch_short() {
+                Some(b) => NodeId::Branch {
+                    repo,
+                    branch: b.to_string(),
+                },
+                None => NodeId::Detached {
+                    repo,
+                    path: wt.path.clone(),
+                },
+            });
+        }
         Self {
             should_quit: false,
-            active_tab: Tab::Overview,
+            active_tab: Tab::Branches,
             show_help: false,
             snapshot,
-            selected,
+            tree,
             transitions: Transitions::default(),
             pending_refresh: false,
             live: LiveStatus::Static,
@@ -161,46 +177,69 @@ impl AppState {
         }
     }
 
-    /// Replace the snapshot (after a manual/live refresh), clamping selection.
+    /// Replace the snapshot (after a manual/live refresh), refreshing the tree
+    /// selection and pruning expansion state for vanished nodes.
     pub fn set_snapshot(&mut self, snapshot: RepoSnapshot) {
         self.snapshot = snapshot;
-        self.clamp_selection();
+        self.refresh_tree_selection();
         self.clamp_proc_selection();
     }
 
-    /// Clamp the selection to the visible (filtered) worktree count.
-    fn clamp_selection(&mut self) {
-        let len = self.visible_indices().len();
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
+    /// The flattened branch-tree rows for the current snapshot + filter.
+    pub fn tree_rows(&self) -> Vec<TreeRow<'_>> {
+        flatten(
+            std::slice::from_ref(&self.snapshot),
+            &self.tree,
+            self.filter.as_deref(),
+        )
+    }
+
+    /// Re-resolve the selection against fresh rows and drop expansion
+    /// overrides for nodes that no longer exist. (Flatten is called with
+    /// disjoint field borrows so `self.tree` stays mutable while the rows
+    /// borrow `self.snapshot`.)
+    fn refresh_tree_selection(&mut self) {
+        // Prune overrides against node EXISTENCE (never visibility — a
+        // collapsed/filtered/inactive node still exists and keeps its fold).
+        self.tree
+            .retain_ids(&live_ids(std::slice::from_ref(&self.snapshot)));
+        let rows = flatten(
+            std::slice::from_ref(&self.snapshot),
+            &self.tree,
+            self.filter.as_deref(),
+        );
+        if let Some(i) = self.tree.selected_index(&rows) {
+            self.tree.select_index(&rows, i);
+        } else {
+            self.tree.selected = None;
         }
     }
 
-    /// Original worktree indices matching the active filter (all if unfiltered).
-    pub fn visible_indices(&self) -> Vec<usize> {
-        match &self.filter {
-            None => (0..self.snapshot.worktrees.len()).collect(),
-            Some(query) => {
-                let q = query.to_lowercase();
+    /// The worktree index the current tree selection resolves to: a branch's
+    /// checkout, a detached worktree, or the worktree owning a selected file.
+    pub fn selected_worktree_index(&self) -> Option<usize> {
+        use crate::util::paths::normalize;
+        let rows = self.tree_rows();
+        let row = rows.get(self.tree.selected_index(&rows)?)?;
+        match &row.kind {
+            RowKind::Branch { node, .. } => node.worktree,
+            RowKind::Detached { wt, .. } => {
+                let target = normalize(&wt.path);
                 self.snapshot
                     .worktrees
                     .iter()
-                    .enumerate()
-                    .filter(|(_, wt)| {
-                        wt.display_name().to_lowercase().contains(&q)
-                            || wt.path.to_lowercase().contains(&q)
-                    })
-                    .map(|(i, _)| i)
-                    .collect()
+                    .position(|w| normalize(&w.path) == target)
             }
+            RowKind::File { .. } | RowKind::FileOverflow { .. } => match &row.id {
+                NodeId::File { branch, .. } => self
+                    .snapshot
+                    .hierarchy
+                    .node(branch)
+                    .and_then(|n| n.worktree),
+                _ => None,
+            },
+            RowKind::Repo { .. } => None,
         }
-    }
-
-    /// The original worktree index currently selected (within the filtered view).
-    pub fn selected_original_index(&self) -> Option<usize> {
-        self.visible_indices().get(self.selected).copied()
     }
 
     /// Whether worktree `idx` is protected from removal: the primary checkout
@@ -260,6 +299,7 @@ impl AppState {
     /// record created/removed worktrees in the archive, swap the snapshot in, and
     /// return the newly-detected events for the caller to persist.
     pub fn ingest_snapshot(&mut self, new: RepoSnapshot) -> Vec<ArchivedEvent> {
+        let repo_key = crate::home::snapshot::repo_key(&new);
         let mut new_events: Vec<ArchivedEvent> = Vec::new();
         let mut notes: Vec<(String, Vec<TransitionKind>)> = Vec::new();
         {
@@ -272,13 +312,13 @@ impl AppState {
             for wt in &new.worktrees {
                 match previous.get(wt.path.as_str()) {
                     None => {
-                        notes.push((wt.path.clone(), vec![TransitionKind::Created]));
+                        notes.push((wt_flash_key(&repo_key, wt), vec![TransitionKind::Created]));
                         new_events.push(event_from(EventKind::WorktreeCreated, wt));
                     }
                     Some(old) => {
                         let kinds = change_kind(old, wt);
                         if !kinds.is_empty() {
-                            notes.push((wt.path.clone(), kinds));
+                            notes.push((wt_flash_key(&repo_key, wt), kinds));
                         }
                     }
                 }
@@ -286,35 +326,14 @@ impl AppState {
             let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
             for old in &self.snapshot.worktrees {
                 if !old.bare && !incoming.contains(old.path.as_str()) {
-                    notes.push((old.path.clone(), vec![TransitionKind::Deleted]));
+                    notes.push((wt_flash_key(&repo_key, old), vec![TransitionKind::Deleted]));
                     new_events.push(event_from(EventKind::WorktreeRemoved, old));
                 }
             }
-            // New merge-conflict-risk pairings (a file changed on a worktree SET
-            // not flagged last snapshot) → log once. Keyed by file + the worktree
-            // paths involved, so a re-paired conflict (A×B → A×C) re-logs.
-            let old_conflicts: HashSet<String> = self
-                .snapshot
-                .collisions
-                .iter()
-                .map(|c| conflict_key(c, &self.snapshot.worktrees))
-                .collect();
-            for c in &new.collisions {
-                if !old_conflicts.contains(&conflict_key(c, &new.worktrees)) {
-                    let who: Vec<String> = c
-                        .worktrees
-                        .iter()
-                        .filter_map(|&i| new.worktrees.get(i).map(WorktreeRecord::display_name))
-                        .collect();
-                    new_events.push(ArchivedEvent::new(
-                        EventKind::ConflictRisk,
-                        c.file.clone(),
-                        Some(who.join(" × ")),
-                        None,
-                        None,
-                    ));
-                }
-            }
+            new_events.extend(conflict_events(&self.snapshot, &new));
+            // Branch milestones (commit / push / merge), diffed on the
+            // hierarchy. These feed the Timeline and OS notifications.
+            new_events.extend(branch_events(&self.snapshot, &new, None));
         }
 
         for (path, seq) in notes {
@@ -330,14 +349,21 @@ impl AppState {
         new_events
     }
 
-    /// The active transient highlight for a worktree path, if any.
-    pub fn transition_for(&self, path: &str) -> Option<TransitionKind> {
-        self.transitions.get(path)
+    /// The active transient highlight for a flash key, if any.
+    pub fn transition_for(&self, key: &str) -> Option<TransitionKind> {
+        self.transitions.get(key)
     }
 
-    /// Flash live save activity for a batch of changed filesystem paths.
+    /// Flash live save activity for a batch of changed filesystem paths: the
+    /// owning branch's row gets the pulse, and so does the specific file row.
     pub fn note_activity(&mut self, paths: &[std::path::PathBuf]) {
-        note_activity_for(&mut self.transitions, &self.snapshot.worktrees, paths);
+        let repo_key = crate::home::snapshot::repo_key(&self.snapshot);
+        note_activity_tree(
+            &mut self.transitions,
+            &repo_key,
+            &self.snapshot.worktrees,
+            paths,
+        );
     }
 
     /// Drop expired transient highlights and status message (animation tick).
@@ -400,9 +426,9 @@ impl AppState {
         &self.snapshot.worktrees
     }
 
-    /// The currently selected worktree, if any (within the filtered view).
+    /// The currently selected worktree, if the tree selection has one.
     pub fn selected_worktree(&self) -> Option<&WorktreeRecord> {
-        let idx = self.selected_original_index()?;
+        let idx = self.selected_worktree_index()?;
         self.snapshot.worktrees.get(idx)
     }
 
@@ -442,15 +468,30 @@ impl AppState {
                 Tab::Processes => Action::RequestKillProcess,
                 _ => Action::RequestKillAgent,
             },
+            // Selection movement only where a selection is VISIBLE — on other
+            // tabs j/k must not silently retarget the hidden tree selection
+            // that x/K/p act on.
             KeyCode::Char('j') | KeyCode::Down => match self.active_tab {
                 Tab::Processes => Action::ProcessDown,
-                _ => Action::MoveDown,
+                Tab::Branches => Action::MoveDown,
+                _ => Action::None,
             },
             KeyCode::Char('k') | KeyCode::Up => match self.active_tab {
                 Tab::Processes => Action::ProcessUp,
-                _ => Action::MoveUp,
+                Tab::Branches => Action::MoveUp,
+                _ => Action::None,
             },
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char('l') | KeyCode::Right if self.active_tab == Tab::Branches => {
+                Action::Expand
+            }
+            KeyCode::Char('h') | KeyCode::Left if self.active_tab == Tab::Branches => {
+                Action::Collapse
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.active_tab == Tab::Branches => {
+                Action::ToggleExpand
+            }
+            KeyCode::Char('a') if self.active_tab == Tab::Branches => Action::ToggleShowAll,
+            KeyCode::Char(c @ '1'..='6') => {
                 let idx = (c as u8 - b'1') as usize;
                 Action::SelectTab(Tab::ALL[idx])
             }
@@ -468,6 +509,34 @@ impl AppState {
             Action::SelectTab(tab) => self.active_tab = tab,
             Action::MoveDown => self.move_selection(1),
             Action::MoveUp => self.move_selection(-1),
+            Action::Expand => {
+                let rows = flatten(
+                    std::slice::from_ref(&self.snapshot),
+                    &self.tree,
+                    self.filter.as_deref(),
+                );
+                self.tree.expand_selected(&rows);
+            }
+            Action::Collapse => {
+                let rows = flatten(
+                    std::slice::from_ref(&self.snapshot),
+                    &self.tree,
+                    self.filter.as_deref(),
+                );
+                self.tree.collapse_selected(&rows);
+            }
+            Action::ToggleExpand => {
+                let rows = flatten(
+                    std::slice::from_ref(&self.snapshot),
+                    &self.tree,
+                    self.filter.as_deref(),
+                );
+                self.tree.toggle_selected(&rows);
+            }
+            Action::ToggleShowAll => {
+                self.tree.show_all = !self.tree.show_all;
+                self.refresh_tree_selection();
+            }
             // The async work runs in the event loop; the reducer records intent.
             Action::Refresh => self.pending_refresh = true,
             Action::Fetch => self.pending_fetch = true,
@@ -479,7 +548,7 @@ impl AppState {
             Action::OpenPalette => self.overlay = Overlay::Palette(Palette::default()),
             Action::ClearFilter => {
                 self.filter = None;
-                self.clamp_selection();
+                self.refresh_tree_selection();
             }
             Action::RequestRemove => self.open_remove_confirm(),
             Action::RequestPrune => self.open_prune_confirm(),
@@ -500,7 +569,7 @@ impl AppState {
         }
     }
 
-    /// Move the selection within the active list (palette or worktrees).
+    /// Move the selection within the active list (palette or branch tree).
     fn move_selection(&mut self, delta: i32) {
         if let Overlay::Palette(p) = &mut self.overlay {
             let len = palette_filtered(&p.query).len();
@@ -509,10 +578,17 @@ impl AppState {
             }
             return;
         }
-        let len = self.visible_indices().len();
-        if len > 0 {
-            self.selected = (self.selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        // Arrows while a Confirm dialog is open must not move the tree
+        // selection behind the operator's back.
+        if matches!(self.overlay, Overlay::Confirm(_)) {
+            return;
         }
+        let rows = flatten(
+            std::slice::from_ref(&self.snapshot),
+            &self.tree,
+            self.filter.as_deref(),
+        );
+        self.tree.move_selection(&rows, delta);
     }
 
     fn input_char(&mut self, c: char) {
@@ -553,7 +629,7 @@ impl AppState {
         };
         if let Some(query) = query {
             self.filter = (!query.is_empty()).then_some(query);
-            self.clamp_selection();
+            self.refresh_tree_selection();
         }
     }
 
@@ -561,7 +637,7 @@ impl AppState {
         match std::mem::take(&mut self.overlay) {
             Overlay::Search { query } => {
                 self.filter = (!query.is_empty()).then_some(query);
-                self.clamp_selection();
+                self.refresh_tree_selection();
             }
             Overlay::Palette(p) => {
                 if let Some(&command) = palette_filtered(&p.query).get(p.selected) {
@@ -596,10 +672,11 @@ impl AppState {
         }
     }
 
-    /// Open a type-to-confirm dialog to remove the selected worktree, unless it
-    /// is protected or has a running process.
+    /// Open a type-to-confirm dialog to remove the selected branch's worktree,
+    /// unless it is protected or has a running process. The branch and its
+    /// commits are kept — only the checkout on disk is removed.
     fn open_remove_confirm(&mut self) {
-        let Some(idx) = self.selected_original_index() else {
+        let Some(idx) = self.selected_worktree_index() else {
             return;
         };
         if self.is_protected(idx) || self.snapshot.processes.worktree_is_active(idx) {
@@ -631,6 +708,8 @@ impl AppState {
             detail.push(line);
         }
         detail.push(String::new());
+        detail.push("Removes the worktree directory and its checkout.".to_string());
+        detail.push("The branch and its commits are kept.".to_string());
         detail.push(if clean {
             "Clean — safe to remove.".to_string()
         } else {
@@ -668,9 +747,9 @@ impl AppState {
     }
 
     /// Open a type-the-PID-to-confirm dialog to kill the agent attached to the
-    /// selected worktree (for a forgotten / stuck background agent).
+    /// selected branch's worktree (for a forgotten / stuck background agent).
     fn open_kill_agent_confirm(&mut self) {
-        let Some(idx) = self.selected_original_index() else {
+        let Some(idx) = self.selected_worktree_index() else {
             return;
         };
         let Some(agent) = self.snapshot.processes.agent_for_worktree(idx) else {
@@ -812,12 +891,159 @@ pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Vec<Tra
     Vec::new()
 }
 
-/// Flash a blue `Activity` marker on the worktree containing each changed path.
-/// Driven by the (un-debounced) filesystem watcher so the marker tracks live
-/// save state. Paths that fall outside every known worktree are ignored. Shared
-/// by the per-repo and home reducers.
-pub(crate) fn note_activity_for(
+/// New merge-conflict-risk pairings (a file changed on a worktree SET not
+/// flagged in the previous snapshot) → one event each. Keyed by file + the
+/// worktree paths involved, so a re-paired conflict (A×B → A×C) re-logs.
+/// Shared by the per-repo and home reducers.
+pub(crate) fn conflict_events(old: &RepoSnapshot, new: &RepoSnapshot) -> Vec<ArchivedEvent> {
+    let old_conflicts: HashSet<String> = old
+        .collisions
+        .iter()
+        .map(|c| conflict_key(c, &old.worktrees))
+        .collect();
+    let mut out = Vec::new();
+    for c in &new.collisions {
+        if !old_conflicts.contains(&conflict_key(c, &new.worktrees)) {
+            let who: Vec<String> = c
+                .worktrees
+                .iter()
+                .filter_map(|&i| new.worktrees.get(i).map(WorktreeRecord::display_name))
+                .collect();
+            out.push(ArchivedEvent::new(
+                EventKind::ConflictRisk,
+                c.file.clone(),
+                Some(who.join(" × ")),
+                None,
+                None,
+            ));
+        }
+    }
+    out
+}
+
+/// Max touched paths carried with a commit-milestone event.
+const EVENT_FILES_CAP: usize = 10;
+
+/// Diff two snapshots' branch hierarchies into milestone events: a commit
+/// (tip moved — rebases suppressed), a push (lifecycle reached `Pushed`), a
+/// merge (lifecycle reached `Merged`, or the branch vanished after merging).
+/// `repo` stamps the events in machine-wide mode.
+pub(crate) fn branch_events(
+    old: &RepoSnapshot,
+    new: &RepoSnapshot,
+    repo: Option<&str>,
+) -> Vec<ArchivedEvent> {
+    use crate::git::BranchLifecycle;
+    let old_by_name: HashMap<&str, &crate::git::BranchNode> = old
+        .hierarchy
+        .nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n))
+        .collect();
+    let mut out = Vec::new();
+
+    for n in &new.hierarchy.nodes {
+        // Brand-new branches don't fire milestones; their appearance is
+        // already covered by the worktree-created event/flash.
+        let Some(o) = old_by_name.get(n.name.as_str()) else {
+            continue;
+        };
+        let path = n
+            .worktree
+            .and_then(|i| new.worktrees.get(i))
+            .map(|w| w.path.clone())
+            .unwrap_or_default();
+        let mk = |kind: EventKind| {
+            let mut ev = ArchivedEvent::new(
+                kind,
+                path.clone(),
+                Some(n.name.clone()),
+                Some(n.oid.chars().take(8).collect()),
+                None,
+            );
+            ev.parent = n.parent.clone();
+            ev.repo = repo.map(str::to_string);
+            ev
+        };
+
+        // A rebase moves the tip without new work: ahead-of-parent didn't
+        // grow and behind-parent drained to zero (the parent moved under us).
+        // Heuristic limits (accepted): an --amend/reword while already level
+        // with the parent still reads as a commit (the cooldown bounds the
+        // noise), and a reset-to-parent on a diverged branch is suppressed.
+        let rebase_signature = n.ahead_of_parent <= o.ahead_of_parent
+            && o.behind_parent.is_some_and(|b| b > 0)
+            && n.behind_parent == Some(0);
+        if o.oid != n.oid && !rebase_signature {
+            let mut ev = mk(EventKind::BranchCommitted);
+            ev.files = n.worktree.and_then(|i| new.worktrees.get(i)).map(|w| {
+                w.touched
+                    .iter()
+                    .take(EVENT_FILES_CAP)
+                    .map(|f| f.path.clone())
+                    .collect()
+            });
+            out.push(ev);
+        }
+        if o.lifecycle != BranchLifecycle::Pushed && n.lifecycle == BranchLifecycle::Pushed {
+            out.push(mk(EventKind::BranchPushed));
+        }
+        if o.lifecycle != BranchLifecycle::Merged && n.lifecycle == BranchLifecycle::Merged {
+            out.push(mk(EventKind::BranchMerged));
+        }
+    }
+
+    // A branch that vanished while MERGED completed its lifecycle — fold the
+    // deletion into a merge milestone. Pushed-but-never-merged branches are
+    // deliberately excluded: deleting (or renaming) an abandoned pushed
+    // branch is not a merge.
+    let new_names: HashSet<&str> = new
+        .hierarchy
+        .nodes
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect();
+    for o in &old.hierarchy.nodes {
+        if !new_names.contains(o.name.as_str())
+            && o.lifecycle == crate::git::BranchLifecycle::Merged
+        {
+            let mut ev = ArchivedEvent::new(
+                EventKind::BranchMerged,
+                String::new(),
+                Some(o.name.clone()),
+                Some(o.oid.chars().take(8).collect()),
+                None,
+            );
+            ev.parent = o.parent.clone();
+            ev.repo = repo.map(str::to_string);
+            out.push(ev);
+        }
+    }
+    out
+}
+
+/// The flash key for a worktree's tree row: its branch node when checked out
+/// on a branch, else its detached-worktree node.
+pub(crate) fn wt_flash_key(repo_key: &str, wt: &WorktreeRecord) -> String {
+    match wt.branch_short() {
+        Some(b) => NodeId::Branch {
+            repo: repo_key.to_string(),
+            branch: b.to_string(),
+        }
+        .flash_key(),
+        None => NodeId::Detached {
+            repo: repo_key.to_string(),
+            path: wt.path.clone(),
+        }
+        .flash_key(),
+    }
+}
+
+/// Tree-keyed activity pulses: the owning branch's row flashes, and when the
+/// changed path maps to a known touched file, that file's row flashes too.
+pub(crate) fn note_activity_tree(
     transitions: &mut Transitions,
+    repo_key: &str,
     worktrees: &[WorktreeRecord],
     paths: &[std::path::PathBuf],
 ) {
@@ -825,8 +1051,32 @@ pub(crate) fn note_activity_for(
     let roots: Vec<String> = worktrees.iter().map(|w| normalize(&w.path)).collect();
     for path in paths {
         let probe = normalize(&path.to_string_lossy());
-        if let Some(idx) = longest_prefix_match(&probe, &roots) {
-            transitions.note(worktrees[idx].path.clone(), TransitionKind::Activity);
+        let Some(idx) = longest_prefix_match(&probe, &roots) else {
+            continue;
+        };
+        let wt = &worktrees[idx];
+        transitions.note(wt_flash_key(repo_key, wt), TransitionKind::Activity);
+
+        // Per-file pulse: match the repo-relative path against the worktree's
+        // touched list (comparing normalized forms, using the file's exact
+        // recorded path for the key so it matches the rendered row).
+        let Some(branch) = wt.branch_short() else {
+            continue;
+        };
+        let Some(rel) = probe
+            .strip_prefix(roots[idx].as_str())
+            .map(|r| r.trim_start_matches('/'))
+        else {
+            continue;
+        };
+        if let Some(file) = wt.touched.iter().find(|f| normalize(&f.path) == rel) {
+            let key = NodeId::File {
+                repo: repo_key.to_string(),
+                branch: branch.to_string(),
+                path: file.path.clone(),
+            }
+            .flash_key();
+            transitions.note(key, TransitionKind::Activity);
         }
     }
 }
@@ -856,8 +1106,10 @@ mod tests {
             worktrees,
             branches: Vec::new(),
             base: None,
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -881,12 +1133,12 @@ mod tests {
     #[test]
     fn tab_cycles_forward_and_wraps() {
         let mut a = app(0);
-        assert_eq!(a.active_tab, Tab::Overview);
+        assert_eq!(a.active_tab, Tab::Branches);
         for _ in 0..Tab::ALL.len() {
             let action = a.resolve_key(key(KeyCode::Tab));
             a.apply(action);
         }
-        assert_eq!(a.active_tab, Tab::Overview); // wrapped fully around
+        assert_eq!(a.active_tab, Tab::Branches); // wrapped fully around
     }
 
     #[test]
@@ -902,7 +1154,11 @@ mod tests {
         let mut a = app(0);
         let action = a.resolve_key(key(KeyCode::Char('3')));
         a.apply(action);
-        assert_eq!(a.active_tab, Tab::Processes);
+        assert_eq!(a.active_tab, Tab::MergeRisk);
+        // '7' no longer maps to anything (6 tabs).
+        assert_eq!(a.resolve_key(key(KeyCode::Char('7'))), Action::None);
+        a.apply(a.resolve_key(key(KeyCode::Char('6'))));
+        assert_eq!(a.active_tab, Tab::Help);
     }
 
     #[test]
@@ -915,24 +1171,47 @@ mod tests {
         assert!(!a.should_quit);
     }
 
+    fn selected_row(a: &AppState) -> Option<usize> {
+        let rows = a.tree_rows();
+        a.tree.selected_index(&rows)
+    }
+
     #[test]
-    fn worktree_navigation_clamps() {
+    fn tree_navigation_clamps() {
+        // 3 branchless worktrees → repo row + 3 detached rows.
         let mut a = app(3);
-        assert_eq!(a.selected, 0);
         a.apply(Action::MoveUp); // already at top
-        assert_eq!(a.selected, 0);
+        assert_eq!(selected_row(&a), Some(0));
         a.apply(Action::MoveDown);
         a.apply(Action::MoveDown);
-        assert_eq!(a.selected, 2);
+        a.apply(Action::MoveDown);
+        assert_eq!(selected_row(&a), Some(3));
         a.apply(Action::MoveDown); // clamp at bottom
-        assert_eq!(a.selected, 2);
+        assert_eq!(selected_row(&a), Some(3));
     }
 
     #[test]
     fn navigation_noop_when_empty() {
+        // No branches, no worktrees → just the repo row.
         let mut a = app(0);
         a.apply(Action::MoveDown);
-        assert_eq!(a.selected, 0);
+        assert_eq!(selected_row(&a), Some(0));
+    }
+
+    #[test]
+    fn a_toggles_show_all_on_the_branches_tab() {
+        let mut a = app(0);
+        assert_eq!(
+            a.resolve_key(key(KeyCode::Char('a'))),
+            Action::ToggleShowAll
+        );
+        a.apply(Action::ToggleShowAll);
+        assert!(a.tree.show_all);
+        a.apply(Action::ToggleShowAll);
+        assert!(!a.tree.show_all);
+        // Not bound outside the Branches tab.
+        a.active_tab = Tab::Processes;
+        assert_eq!(a.resolve_key(key(KeyCode::Char('a'))), Action::None);
     }
 
     fn snapshot_paths(paths: &[&str]) -> RepoSnapshot {
@@ -954,8 +1233,10 @@ mod tests {
             worktrees,
             branches: Vec::new(),
             base: None,
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -1091,22 +1372,161 @@ mod tests {
         );
     }
 
+    fn bnode(
+        name: &str,
+        oid: &str,
+        lifecycle: crate::git::BranchLifecycle,
+    ) -> crate::git::BranchNode {
+        crate::git::BranchNode {
+            name: name.to_string(),
+            oid: oid.to_string(),
+            role: crate::git::BranchRole::Task,
+            parent: Some("emmett/wb-2026-06-10".to_string()),
+            ahead_of_parent: 1,
+            behind_parent: Some(0),
+            merged_into_parent: false,
+            upstream: None,
+            ahead: None,
+            behind: None,
+            upstream_gone: false,
+            committer_date: None,
+            lifecycle,
+            worktree: None,
+        }
+    }
+
+    fn snap_with_nodes(nodes: Vec<crate::git::BranchNode>) -> RepoSnapshot {
+        let mut s = snapshot_paths(&[]);
+        s.hierarchy = crate::git::BranchHierarchy {
+            trunk: Some("main".to_string()),
+            nodes,
+            approximate: false,
+        };
+        s
+    }
+
     #[test]
-    fn note_activity_flashes_the_containing_worktree() {
+    fn branch_commit_milestone_on_tip_move() {
+        use crate::git::BranchLifecycle::Committed;
+        let old = snap_with_nodes(vec![bnode("feat/x", "aaaa", Committed)]);
+        let new = snap_with_nodes(vec![bnode("feat/x", "bbbb", Committed)]);
+        let events = branch_events(&old, &new, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::BranchCommitted);
+        assert_eq!(events[0].branch.as_deref(), Some("feat/x"));
+        assert_eq!(events[0].parent.as_deref(), Some("emmett/wb-2026-06-10"));
+    }
+
+    #[test]
+    fn rebase_does_not_fire_a_commit_milestone() {
+        use crate::git::BranchLifecycle::Committed;
+        // Tip moved, but ahead didn't grow and behind-parent drained to 0:
+        // the parent moved under us (a rebase), not new work.
+        let mut before = bnode("feat/x", "aaaa", Committed);
+        before.behind_parent = Some(2);
+        let after = bnode("feat/x", "bbbb", Committed);
+        let events = branch_events(
+            &snap_with_nodes(vec![before]),
+            &snap_with_nodes(vec![after]),
+            None,
+        );
+        assert!(events.is_empty(), "a rebase is not a commit milestone");
+    }
+
+    #[test]
+    fn push_and_merge_milestones_on_lifecycle_transitions() {
+        use crate::git::BranchLifecycle::{Committed, Merged, Pushed};
+        let old = snap_with_nodes(vec![
+            bnode("feat/p", "aaaa", Committed),
+            bnode("feat/m", "cccc", Pushed),
+        ]);
+        let new = snap_with_nodes(vec![
+            bnode("feat/p", "aaaa", Pushed),
+            bnode("feat/m", "cccc", Merged),
+        ]);
+        let events = branch_events(&old, &new, None);
+        let kinds: Vec<(EventKind, &str)> = events
+            .iter()
+            .map(|e| (e.kind, e.branch.as_deref().unwrap_or("")))
+            .collect();
+        assert!(kinds.contains(&(EventKind::BranchPushed, "feat/p")));
+        assert!(kinds.contains(&(EventKind::BranchMerged, "feat/m")));
+        assert_eq!(events.len(), 2, "steady branches stay quiet");
+    }
+
+    #[test]
+    fn vanished_merged_branch_folds_into_a_merge_milestone() {
+        use crate::git::BranchLifecycle::{Committed, Merged};
+        let old = snap_with_nodes(vec![
+            bnode("feat/done", "aaaa", Merged),
+            bnode("feat/wip", "bbbb", Committed),
+        ]);
+        // feat/done deleted after merge; feat/wip deleted prematurely.
+        let new = snap_with_nodes(vec![]);
+        let events = branch_events(&old, &new, Some("myrepo"));
+        assert_eq!(
+            events.len(),
+            1,
+            "only the merged branch folds into an event"
+        );
+        assert_eq!(events[0].kind, EventKind::BranchMerged);
+        assert_eq!(events[0].branch.as_deref(), Some("feat/done"));
+        assert_eq!(events[0].repo.as_deref(), Some("myrepo"));
+    }
+
+    #[test]
+    fn brand_new_branch_fires_no_milestone() {
+        use crate::git::BranchLifecycle::Committed;
+        let old = snap_with_nodes(vec![]);
+        let new = snap_with_nodes(vec![bnode("feat/new", "aaaa", Committed)]);
+        assert!(branch_events(&old, &new, None).is_empty());
+    }
+
+    #[test]
+    fn note_activity_flashes_the_containing_worktree_row() {
         let mut app = AppState::new(snapshot_paths(&["/repo/main", "/repo/feat"]));
         app.note_activity(&[std::path::PathBuf::from("/repo/feat/src/lib.rs")]);
+        let rkey = crate::home::snapshot::repo_key(&app.snapshot);
+        let feat_key = wt_flash_key(&rkey, &app.snapshot.worktrees[1]);
+        let main_key = wt_flash_key(&rkey, &app.snapshot.worktrees[0]);
         assert_eq!(
-            app.transition_for("/repo/feat"),
+            app.transition_for(&feat_key),
             Some(TransitionKind::Activity)
         );
-        assert_eq!(app.transition_for("/repo/main"), None);
+        assert_eq!(app.transition_for(&main_key), None);
+    }
+
+    #[test]
+    fn note_activity_pulses_the_specific_file_row() {
+        use crate::git::{ChangeKind, FileChange};
+        let mut snap = snapshot_paths(&["/repo/feat"]);
+        snap.worktrees[0].branch = Some("refs/heads/feat/x".into());
+        snap.worktrees[0].touched = vec![FileChange {
+            path: "src/lib.rs".into(),
+            kind: ChangeKind::Modified,
+        }];
+        let mut app = AppState::new(snap);
+        app.note_activity(&[std::path::PathBuf::from("/repo/feat/src/lib.rs")]);
+        let rkey = crate::home::snapshot::repo_key(&app.snapshot);
+        let file_key = NodeId::File {
+            repo: rkey,
+            branch: "feat/x".into(),
+            path: "src/lib.rs".into(),
+        }
+        .flash_key();
+        assert_eq!(
+            app.transition_for(&file_key),
+            Some(TransitionKind::Activity)
+        );
     }
 
     #[test]
     fn note_activity_ignores_paths_outside_any_worktree() {
         let mut app = AppState::new(snapshot_paths(&["/repo/main"]));
         app.note_activity(&[std::path::PathBuf::from("/elsewhere/x.rs")]);
-        assert_eq!(app.transition_for("/repo/main"), None);
+        let rkey = crate::home::snapshot::repo_key(&app.snapshot);
+        let key = wt_flash_key(&rkey, &app.snapshot.worktrees[0]);
+        assert_eq!(app.transition_for(&key), None);
     }
 
     fn agent_proc(pid: u32, wt: usize) -> ProcessInfo {
@@ -1130,7 +1550,9 @@ mod tests {
             processes: vec![agent_proc(pid, 0)],
         };
         let mut app = AppState::new(snap);
-        app.active_tab = Tab::Worktrees;
+        app.active_tab = Tab::Branches;
+        // Move off the repo row onto the worktree's row so K resolves to it.
+        app.apply(Action::MoveDown);
         app
     }
 

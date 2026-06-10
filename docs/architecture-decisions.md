@@ -49,3 +49,39 @@ manual CLAUDE.md procedure; WB-300 keeps the same cycle but scripts it).
 `release.yml` fires only on a pushed `vX.Y.Z` tag; `crates-publish.yml` publishes from a green
 CI run on `main`. Deploying is deliberate (no accidental release on every push to `main`), which
 is why the trigger is a tag rather than a branch push.
+
+## v2: the branch tree is the product (2026-06-10)
+
+v1 was worktree-first with a name-prefix "workbranch" grouping; that encoded a wrong mental
+model (one branch ↔ many worktrees). Git enforces one checkout per branch, so v2 makes the
+branch hierarchy the primary view and derives it from commit topology — one batched,
+fingerprint-cached `rev-list` over the off-trunk history, nearest-strict-ancestor parentage,
+with naming conventions only breaking genuine ties. Rejected alternatives: pure name heuristics
+(wrong, the v1 mistake), per-branch `merge-base` pairs (O(B²) subprocesses), and recording
+parentage at branch-creation time (wb300 doesn't create branches and can't see other tools').
+Repos that follow no convention degrade to a flat list rather than failing.
+
+## v2: OS toasts only, for exactly three events
+
+The operator chose native notifications over an in-TUI alert area: the point of a tap on the
+shoulder is being heard when the terminal is NOT focused. Scope is deliberately tight — commit,
+push, merge-conflict risk; never agent-exit or idle — to keep toasts meaning something. Policy
+(coalescing, cooldown, gating) is a pure, tested struct; the backend (notify-rust; zbus on
+Linux to avoid the libdbus link; a self-registered HKCU AppUserModelID on Windows) fails soft:
+log once, disable for the session, never block the UI. Installer-owned AUMID + icon is a
+recorded TODO because it touches the four-installer lockstep contract.
+
+## v2: unified home tree, mutations stay behind drill-in
+
+The machine-wide view renders the same tree widget with repo nodes at the root (one window,
+whole fleet) — but `x`/`K`/`f`/`p` remain in the drilled-in per-repo view. Replicating the
+PendingGit/Kill/event-store machinery multi-repo was judged real risk for marginal gain; the
+home view observes, the per-repo view acts.
+
+## v2: clean break to agent schema v2
+
+`wb300.agent.v1`'s `workbranches` grouping reproduced the wrong model, so v2 replaces it with
+the real hierarchy (flat, depth-first, parent pointers — trivially reconstructable as a tree
+and easier to evolve than nesting). A clean break (major version bump, schema tag) was chosen
+over emitting both schemas: the only known consumer is the operator's own tooling, and dual
+output would have doubled the golden-test surface for no consumer benefit.

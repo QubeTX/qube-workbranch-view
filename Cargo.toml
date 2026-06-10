@@ -1,6 +1,6 @@
 [package]
 name = "wb300"
-version = "1.2.0"
+version = "2.0.0"
 edition = "2024"
 # Edition 2024 (the latest). Editions are per-crate language epochs, not version
 # or dependency constraints — they only need Rust >= 1.85. MSRV is pinned in
@@ -50,6 +50,13 @@ sysinfo = "0.39.3"
 notify = "8.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Minimal TOML config (notification toggles); unknown keys are ignored.
+toml = "0.8"
+# OS toast notifications (commit/push milestones, merge-conflict risk).
+# default-features off + "z" picks the pure-Rust zbus backend on Linux (no
+# libdbus link, musl-friendly); Windows (WinRT) and macOS backends are
+# unaffected by the feature choice.
+notify-rust = { version = "4", default-features = false, features = ["z"] }
 # HTTP client for `wb300 update`: queries the GitHub releases API and (on
 # Windows) downloads the matching MSI/EXE installer. Blocking + tiny dep tree;
 # the updater runs synchronously outside the Tokio TUI loop.

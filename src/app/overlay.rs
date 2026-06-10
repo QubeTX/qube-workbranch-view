@@ -85,8 +85,8 @@ impl Command {
             Command::Refresh => "refresh snapshot",
             Command::Fetch => "fetch from remotes",
             Command::Prune => "prune stale worktree metadata",
-            Command::RemoveSelected => "remove selected worktree",
-            Command::Search => "search / filter worktrees",
+            Command::RemoveSelected => "remove selected branch's worktree",
+            Command::Search => "search / filter branches",
         }
     }
 }

@@ -1,22 +1,25 @@
 //! State + reducer for the machine-wide home view.
 //!
-//! Mirrors the per-repo `AppState` shape at a coarser grain: the snapshot is a
-//! `HomeSnapshot` (one captured repo per card), selection moves over repo
-//! cards, and `Enter` drills into the selected repo's full per-repo view. Live
-//! flashes are keyed by worktree path (globally unique across repos), reusing
-//! the same `change_kind` heuristic as the per-repo reducer.
+//! The home view is the SAME branch tree as the per-repo view, with one repo
+//! node at the root per active repository — one window, every repo, every
+//! branch, every agent. Navigation and expansion reuse `app::tree`; `Enter`
+//! drills into the selected repo's full per-repo view (where mutations live).
 
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::snapshot::{HomeSnapshot, repo_key};
-use crate::app::state::change_kind;
+use crate::app::state::{
+    branch_events, change_kind, conflict_events, note_activity_tree, wt_flash_key,
+};
+use crate::app::tree::{NodeId, TreeRow, TreeState, flatten, live_ids};
 use crate::app::{LiveStatus, TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
+use crate::storage::ArchivedEvent;
 
 /// What a key press means in the home view. A small local enum — the per-repo
-/// `Action` set (overlays, fetch, remove, …) doesn't apply here.
+/// mutation actions (remove / kill / fetch) live in the drilled-in view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeAction {
     None,
@@ -24,25 +27,30 @@ enum HomeAction {
     ToggleHelp,
     MoveUp,
     MoveDown,
+    Expand,
+    Collapse,
+    ToggleExpand,
+    ToggleShowAll,
     Refresh,
     DrillIn,
 }
 
-/// The home-view state. `snapshot` is the captured truth; selection and flashes
-/// are derived/transient.
+/// The home-view state. `snapshot` is the captured truth; tree state and
+/// flashes are derived/transient.
 #[derive(Debug)]
 pub struct HomeState {
     pub should_quit: bool,
     pub snapshot: HomeSnapshot,
-    /// Selected repo-card index.
-    pub selected: usize,
-    /// Transient per-worktree highlights (keyed by path).
+    /// Expansion + selection over the machine-wide tree.
+    pub tree: TreeState,
+    /// Transient highlights, keyed by `NodeId::flash_key` (globally unique
+    /// across repos via the repo key).
     pub transitions: Transitions,
     pub live: LiveStatus,
     pub show_help: bool,
     pending_refresh: bool,
-    /// Set by `Enter`; consumed by the event loop to drill into the selection.
-    drill_in: bool,
+    /// Set by `Enter`: the repo key to drill into; consumed by the event loop.
+    drill_in: Option<String>,
 }
 
 impl HomeState {
@@ -50,23 +58,23 @@ impl HomeState {
         Self {
             should_quit: false,
             snapshot,
-            selected: 0,
+            tree: TreeState::default(),
             transitions: Transitions::default(),
             live: LiveStatus::Static,
             show_help: false,
             pending_refresh: false,
-            drill_in: false,
+            drill_in: None,
         }
     }
 
-    /// Number of repo cards.
+    /// Number of active repos.
     pub fn repo_count(&self) -> usize {
         self.snapshot.repos.len()
     }
 
-    /// The selected repo snapshot, if any.
-    pub fn selected_repo(&self) -> Option<&RepoSnapshot> {
-        self.snapshot.repos.get(self.selected)
+    /// The flattened machine-wide tree rows.
+    pub fn tree_rows(&self) -> Vec<TreeRow<'_>> {
+        flatten(&self.snapshot.repos, &self.tree, None)
     }
 
     /// Resolve a key press to a [`HomeAction`].
@@ -78,8 +86,12 @@ impl HomeState {
             KeyCode::Char('?') => HomeAction::ToggleHelp,
             KeyCode::Char('r') => HomeAction::Refresh,
             KeyCode::Enter => HomeAction::DrillIn,
+            KeyCode::Char(' ') => HomeAction::ToggleExpand,
+            KeyCode::Char('a') => HomeAction::ToggleShowAll,
             KeyCode::Char('j') | KeyCode::Down => HomeAction::MoveDown,
             KeyCode::Char('k') | KeyCode::Up => HomeAction::MoveUp,
+            KeyCode::Char('l') | KeyCode::Right => HomeAction::Expand,
+            KeyCode::Char('h') | KeyCode::Left => HomeAction::Collapse,
             _ => HomeAction::None,
         }
     }
@@ -90,22 +102,36 @@ impl HomeState {
             HomeAction::None => {}
             HomeAction::Quit => self.should_quit = true,
             HomeAction::ToggleHelp => self.show_help = !self.show_help,
-            HomeAction::MoveUp => self.move_selection(-1),
-            HomeAction::MoveDown => self.move_selection(1),
+            HomeAction::MoveUp => self.with_rows(|tree, rows| tree.move_selection(rows, -1)),
+            HomeAction::MoveDown => self.with_rows(|tree, rows| tree.move_selection(rows, 1)),
+            HomeAction::Expand => self.with_rows(|tree, rows| tree.expand_selected(rows)),
+            HomeAction::Collapse => self.with_rows(|tree, rows| tree.collapse_selected(rows)),
+            HomeAction::ToggleExpand => self.with_rows(|tree, rows| tree.toggle_selected(rows)),
+            HomeAction::ToggleShowAll => {
+                self.tree.show_all = !self.tree.show_all;
+                self.refresh_tree_selection();
+            }
             HomeAction::Refresh => self.pending_refresh = true,
             HomeAction::DrillIn => {
-                if self.selected_repo().is_some() {
-                    self.drill_in = true;
+                let rows = flatten(&self.snapshot.repos, &self.tree, None);
+                if let Some(i) = self.tree.selected_index(&rows) {
+                    let key = match &rows[i].id {
+                        NodeId::Repo { repo }
+                        | NodeId::Branch { repo, .. }
+                        | NodeId::Detached { repo, .. }
+                        | NodeId::File { repo, .. } => repo.clone(),
+                    };
+                    self.drill_in = Some(key);
                 }
             }
         }
     }
 
-    fn move_selection(&mut self, delta: i32) {
-        let len = self.repo_count();
-        if len > 0 {
-            self.selected = (self.selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
-        }
+    /// Run a tree-state mutation with rows computed from disjoint field
+    /// borrows (`snapshot` immutably, `tree` mutably).
+    fn with_rows(&mut self, f: impl FnOnce(&mut TreeState, &[TreeRow])) {
+        let rows = flatten(&self.snapshot.repos, &self.tree, None);
+        f(&mut self.tree, &rows);
     }
 
     /// Consume the pending-refresh flag (set by `r`).
@@ -116,11 +142,12 @@ impl HomeState {
     /// Consume a pending drill-in, returning a clone of the selected repo
     /// snapshot for the per-repo view to take over.
     pub fn take_drill_in(&mut self) -> Option<RepoSnapshot> {
-        if std::mem::take(&mut self.drill_in) {
-            self.selected_repo().cloned()
-        } else {
-            None
-        }
+        let key = self.drill_in.take()?;
+        self.snapshot
+            .repos
+            .iter()
+            .find(|r| repo_key(r) == key)
+            .cloned()
     }
 
     pub fn set_live_status(&mut self, status: LiveStatus) {
@@ -131,13 +158,13 @@ impl HomeState {
         self.transitions.expire();
     }
 
-    /// The active transient highlight for a worktree path, if any.
-    pub fn transition_for(&self, path: &str) -> Option<TransitionKind> {
-        self.transitions.get(path)
+    /// The active transient highlight for a flash key, if any.
+    pub fn transition_for(&self, key: &str) -> Option<TransitionKind> {
+        self.transitions.get(key)
     }
 
-    /// Flash live save activity for a batch of changed filesystem paths, mapping
-    /// each across every repo's worktrees (a path belongs to exactly one).
+    /// Flash live save activity for a batch of changed filesystem paths,
+    /// mapping each across every repo's worktrees (a path belongs to one).
     pub fn note_activity(&mut self, paths: &[std::path::PathBuf]) {
         let Self {
             snapshot,
@@ -145,14 +172,17 @@ impl HomeState {
             ..
         } = self;
         for repo in &snapshot.repos {
-            crate::app::state::note_activity_for(transitions, &repo.worktrees, paths);
+            let rkey = repo_key(repo);
+            note_activity_tree(transitions, &rkey, &repo.worktrees, paths);
         }
     }
 
-    /// Swap in a freshly captured machine-wide snapshot, raising per-worktree
-    /// flashes for repos seen in the previous scan (created / modified / pushed
-    /// / deleted). New repos don't flash every worktree on first sight.
-    pub fn ingest_snapshot(&mut self, new: HomeSnapshot) {
+    /// Swap in a freshly captured machine-wide snapshot, raising branch-keyed
+    /// flashes for repos seen in the previous scan. New repos don't flash
+    /// every row on first sight. Returns branch milestone events across all
+    /// matched repos, each stamped with its repo name — the machine-wide feed
+    /// for notifications.
+    pub fn ingest_snapshot(&mut self, new: HomeSnapshot) -> Vec<ArchivedEvent> {
         let old_by_key: HashMap<String, &RepoSnapshot> = self
             .snapshot
             .repos
@@ -161,32 +191,47 @@ impl HomeState {
             .collect();
 
         let mut notes: Vec<(String, Vec<TransitionKind>)> = Vec::new();
+        let mut events: Vec<ArchivedEvent> = Vec::new();
         for new_repo in &new.repos {
-            if let Some(old_repo) = old_by_key.get(&repo_key(new_repo)) {
-                collect_repo_transitions(old_repo, new_repo, &mut notes);
+            let rkey = repo_key(new_repo);
+            if let Some(old_repo) = old_by_key.get(&rkey) {
+                collect_repo_transitions(&rkey, old_repo, new_repo, &mut notes);
+                let name = super::snapshot::repo_name(new_repo);
+                events.extend(branch_events(old_repo, new_repo, Some(&name)));
+                for mut ev in conflict_events(old_repo, new_repo) {
+                    ev.repo = Some(name.clone());
+                    events.push(ev);
+                }
             }
         }
-        for (path, seq) in notes {
-            self.transitions.note_seq(path, seq);
+        for (key, seq) in notes {
+            self.transitions.note_seq(key, seq);
         }
 
         self.snapshot = new;
-        self.clamp_selection();
+        self.refresh_tree_selection();
+        events
     }
 
-    fn clamp_selection(&mut self) {
-        let len = self.repo_count();
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
+    /// Re-resolve the selection and prune expansion state after the snapshot
+    /// (or the active-only scope) changed.
+    fn refresh_tree_selection(&mut self) {
+        // Prune overrides against node EXISTENCE (never visibility — a
+        // collapsed/filtered/inactive node still exists and keeps its fold).
+        self.tree.retain_ids(&live_ids(&self.snapshot.repos));
+        let rows = flatten(&self.snapshot.repos, &self.tree, None);
+        if let Some(i) = self.tree.selected_index(&rows) {
+            self.tree.select_index(&rows, i);
+        } else {
+            self.tree.selected = None;
         }
     }
 }
 
 /// Diff one repo's worktrees between scans, pushing flash notes (created /
-/// modified / pushed / deleted) keyed by worktree path.
+/// modified / pushed / deleted) keyed by the worktree's tree-row identity.
 fn collect_repo_transitions(
+    rkey: &str,
     old: &RepoSnapshot,
     new: &RepoSnapshot,
     notes: &mut Vec<(String, Vec<TransitionKind>)>,
@@ -199,11 +244,11 @@ fn collect_repo_transitions(
 
     for wt in &new.worktrees {
         match previous.get(wt.path.as_str()) {
-            None => notes.push((wt.path.clone(), vec![TransitionKind::Created])),
+            None => notes.push((wt_flash_key(rkey, wt), vec![TransitionKind::Created])),
             Some(old_wt) => {
                 let kinds = change_kind(old_wt, wt);
                 if !kinds.is_empty() {
-                    notes.push((wt.path.clone(), kinds));
+                    notes.push((wt_flash_key(rkey, wt), kinds));
                 }
             }
         }
@@ -212,7 +257,7 @@ fn collect_repo_transitions(
     let incoming: HashSet<&str> = new.worktrees.iter().map(|wt| wt.path.as_str()).collect();
     for old_wt in &old.worktrees {
         if !old_wt.bare && !incoming.contains(old_wt.path.as_str()) {
-            notes.push((old_wt.path.clone(), vec![TransitionKind::Deleted]));
+            notes.push((wt_flash_key(rkey, old_wt), vec![TransitionKind::Deleted]));
         }
     }
 }
@@ -236,8 +281,10 @@ mod tests {
             base: None,
             worktrees,
             branches: Vec::new(),
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -259,19 +306,26 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn selected_row(s: &HomeState) -> Option<usize> {
+        let rows = s.tree_rows();
+        s.tree.selected_index(&rows)
+    }
+
     #[test]
-    fn selection_clamps_to_repo_count() {
+    fn tree_navigation_clamps_across_repos() {
+        // Two repos, each with one branchless worktree → 4 rows total
+        // (repo, detached, repo, detached).
         let mut s = HomeState::new(home(vec![
             repo("/a", vec![wt("/a/root")]),
             repo("/b", vec![wt("/b/root")]),
         ]));
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.tree_rows().len(), 4);
         s.handle_key(key(KeyCode::Char('k'))); // already at top
-        assert_eq!(s.selected, 0);
-        s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
-        s.handle_key(key(KeyCode::Char('j'))); // clamp at bottom
-        assert_eq!(s.selected, 1);
+        assert_eq!(selected_row(&s), Some(0));
+        for _ in 0..5 {
+            s.handle_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(selected_row(&s), Some(3), "clamped at the last row");
     }
 
     #[test]
@@ -282,9 +336,31 @@ mod tests {
 
         let mut s = HomeState::new(home(vec![repo("/a", vec![wt("/a/root")])]));
         s.handle_key(key(KeyCode::Enter));
-        assert!(s.take_drill_in().is_some());
+        let drilled = s.take_drill_in().expect("repo resolved");
+        assert_eq!(
+            drilled.repo.common_git_dir,
+            std::path::PathBuf::from("/a/.git")
+        );
         // Consumed — a second take yields nothing.
         assert!(s.take_drill_in().is_none());
+    }
+
+    #[test]
+    fn enter_on_a_child_row_drills_into_its_repo() {
+        let mut s = HomeState::new(home(vec![
+            repo("/a", vec![wt("/a/root")]),
+            repo("/b", vec![wt("/b/root")]),
+        ]));
+        // Move onto repo B's detached row (row 3) and drill in.
+        for _ in 0..3 {
+            s.handle_key(key(KeyCode::Char('j')));
+        }
+        s.handle_key(key(KeyCode::Enter));
+        let drilled = s.take_drill_in().expect("repo resolved from child row");
+        assert_eq!(
+            drilled.repo.common_git_dir,
+            std::path::PathBuf::from("/b/.git")
+        );
     }
 
     #[test]
@@ -303,9 +379,12 @@ mod tests {
     fn ingest_flashes_created_and_deleted_within_a_known_repo() {
         let mut s = HomeState::new(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-x")])]));
         // Same repo (same common dir), feat-x removed and feat-y added.
-        s.ingest_snapshot(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-y")])]));
-        assert_eq!(s.transition_for("/a/feat-y"), Some(TransitionKind::Created));
-        assert_eq!(s.transition_for("/a/feat-x"), Some(TransitionKind::Deleted));
+        let _ = s.ingest_snapshot(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-y")])]));
+        let rkey = repo_key(&s.snapshot.repos[0]);
+        let created = wt_flash_key(&rkey, &wt("/a/feat-y"));
+        let deleted = wt_flash_key(&rkey, &wt("/a/feat-x"));
+        assert_eq!(s.transition_for(&created), Some(TransitionKind::Created));
+        assert_eq!(s.transition_for(&deleted), Some(TransitionKind::Deleted));
     }
 
     #[test]
@@ -333,8 +412,10 @@ mod tests {
             ..Default::default()
         };
         let mut s = HomeState::new(home(vec![repo("/a", vec![ahead])]));
-        s.ingest_snapshot(home(vec![repo("/a", vec![pushed])]));
-        assert_eq!(s.transition_for("/a/feat"), Some(TransitionKind::Pushed));
+        let _ = s.ingest_snapshot(home(vec![repo("/a", vec![pushed.clone()])]));
+        let rkey = repo_key(&s.snapshot.repos[0]);
+        let pushed_key = wt_flash_key(&rkey, &pushed);
+        assert_eq!(s.transition_for(&pushed_key), Some(TransitionKind::Pushed));
     }
 
     #[test]
@@ -344,8 +425,19 @@ mod tests {
             repo("/b", vec![wt("/b/root")]),
         ]));
         s.note_activity(&[std::path::PathBuf::from("/a/feat/src/x.rs")]);
-        assert_eq!(s.transition_for("/a/feat"), Some(TransitionKind::Activity));
-        assert_eq!(s.transition_for("/a/root"), None);
-        assert_eq!(s.transition_for("/b/root"), None);
+        let rkey_a = repo_key(&s.snapshot.repos[0]);
+        let rkey_b = repo_key(&s.snapshot.repos[1]);
+        assert_eq!(
+            s.transition_for(&wt_flash_key(&rkey_a, &wt("/a/feat"))),
+            Some(TransitionKind::Activity)
+        );
+        assert_eq!(
+            s.transition_for(&wt_flash_key(&rkey_a, &wt("/a/root"))),
+            None
+        );
+        assert_eq!(
+            s.transition_for(&wt_flash_key(&rkey_b, &wt("/b/root"))),
+            None
+        );
     }
 }

@@ -9,13 +9,17 @@ pub mod app;
 pub mod cleanup;
 pub mod cli;
 pub mod collision;
+pub mod config;
 pub mod git;
+pub mod help;
 pub mod home;
 pub mod live;
+pub mod notifications;
 pub mod process;
 pub mod storage;
 pub mod terminal;
 pub mod ui;
+pub mod uninstall;
 pub mod update;
 pub mod util;
 
@@ -44,6 +48,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     // pure-JSON stdout contract.
     if let Some(Command::Agent) = &cli.command {
         return run_agent(&cli).await;
+    }
+
+    // `wb300 help`: the full manual, no TUI.
+    if let Some(Command::Help) = &cli.command {
+        std::process::exit(help::run(!cli.no_color));
+    }
+
+    // `wb300 uninstall`: plain CLI flow, no TUI.
+    if let Some(Command::Uninstall(args)) = &cli.command {
+        std::process::exit(uninstall::run(args));
     }
 
     terminal::install_panic_hook()?;
@@ -100,19 +114,38 @@ pub async fn run(cli: Cli) -> Result<()> {
         mouse: false,
     };
     let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
-    let result = run_loop(&mut terminal, snapshot, cli.no_live).await;
+    // One notifier per process: a single NotifyPolicy instance owns the
+    // cooldowns, so milestones can never double-toast.
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<notifications::NotifyEvent>(64);
+    let _notifier = notifications::spawn_notifier(effective_notify(&cli), notify_rx);
+    let result = run_loop(&mut terminal, snapshot, cli.no_live, notify_tx).await;
     guard.restore();
     result
+}
+
+/// The notification config for this run: the user's config file, with the
+/// master switch forced off by `--no-notify`.
+fn effective_notify(cli: &Cli) -> config::NotifyConfig {
+    let mut cfg = config::load().notifications;
+    if cli.no_notify {
+        cfg.enabled = false;
+    }
+    cfg
 }
 
 /// The render/input loop: a `tokio::select!` over terminal input, debounced
 /// filesystem refreshes, a periodic poll backstop, an animation tick, and
 /// completed snapshot captures. Captures run on spawned tasks so the UI never
 /// blocks on Git (handoff §8).
+///
+/// `notify_tx` feeds the process-wide notifier task (toasts) — events flow
+/// reducer → loop → notifier via `try_send`: a dropped toast is fine, a
+/// blocked UI is not.
 async fn run_loop(
     terminal: &mut terminal::Tui,
     snapshot: git::RepoSnapshot,
     no_live: bool,
+    notify_tx: tokio::sync::mpsc::Sender<notifications::NotifyEvent>,
 ) -> Result<()> {
     let repo = snapshot.repo.clone();
     let mut app = AppState::new(snapshot);
@@ -207,7 +240,11 @@ async fn run_loop(
                 match result {
                     Some(snapshot) => {
                         app.set_stale(false);
+                        let repo_label = home::repo_name(&snapshot);
                         for event in app.ingest_snapshot(snapshot) {
+                            if let Some(n) = notifications::from_archived(&event, &repo_label) {
+                                let _ = notify_tx.try_send(n);
+                            }
                             let _ = event_writer.send(event);
                         }
                     }
@@ -335,7 +372,7 @@ fn install_file_logging(dir: &std::path::Path) {
 }
 
 /// `wb300 agent`: capture the current repo (or the machine-wide view) and print
-/// it as JSON, no TUI. The schema is stable (`wb300.agent.v1`, see `agent.rs`).
+/// it as JSON, no TUI. The schema is stable (`wb300.agent.v2`, see `agent.rs`).
 async fn run_agent(cli: &Cli) -> Result<()> {
     let report = if cli.home {
         agent_home_report().await
@@ -393,7 +430,12 @@ async fn run_home_entry(cli: &Cli) -> Result<()> {
         mouse: false,
     };
     let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
-    let result = run_home_loop(&mut terminal, config, snapshot, cli.no_live).await;
+    // One notifier per process, shared with any drilled-in per-repo loop —
+    // a single NotifyPolicy owns the cooldowns, so returning from a drill-in
+    // can never replay the same milestone as a duplicate toast.
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<notifications::NotifyEvent>(64);
+    let _notifier = notifications::spawn_notifier(effective_notify(cli), notify_rx);
+    let result = run_home_loop(&mut terminal, config, snapshot, cli.no_live, notify_tx).await;
     guard.restore();
     result
 }
@@ -408,6 +450,7 @@ async fn run_home_loop(
     config: home::HomeConfig,
     snapshot: home::HomeSnapshot,
     no_live: bool,
+    notify_tx: tokio::sync::mpsc::Sender<notifications::NotifyEvent>,
 ) -> Result<()> {
     let config = std::sync::Arc::new(config);
     let mut home = home::HomeState::new(snapshot);
@@ -470,14 +513,19 @@ async fn run_home_loop(
             _ = anim.tick() => home.expire_transitions(),
             Some(snapshot) = snap_rx.recv() => {
                 in_flight = false;
-                home.ingest_snapshot(snapshot);
+                for event in home.ingest_snapshot(snapshot) {
+                    // Home events arrive repo-stamped; no fallback label needed.
+                    if let Some(n) = notifications::from_archived(&event, "") {
+                        let _ = notify_tx.try_send(n);
+                    }
+                }
             }
         }
 
         // Drill-in: hand the terminal to the per-repo view for the selected
         // repo, then return to the home view and rescan to pick up any change.
         if let Some(repo_snapshot) = home.take_drill_in() {
-            run_loop(terminal, repo_snapshot, no_live).await?;
+            run_loop(terminal, repo_snapshot, no_live, notify_tx.clone()).await?;
             // While drilled in, the home `select!` wasn't draining `refresh_rx`,
             // so the fs-watch debouncer may have queued a backlog. Drain it (and
             // unblock the debouncer) so we do one fresh rescan, not a burst.

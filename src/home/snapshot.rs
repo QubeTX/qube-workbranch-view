@@ -130,23 +130,6 @@ fn basename(path: &str) -> String {
         .to_string()
 }
 
-/// Heuristic "workbranch" grouping label for a branch.
-///
-/// The team workflow uses `<dev>/wb-<date>` workbranches with `<type>/<desc>`
-/// task branches created off them; Git doesn't record that parentage cheaply,
-/// so we group by the branch's top-level segment (`emmett`, `feat`, `fix`, …) —
-/// which, with one workbranch per developer per day, is a good proxy. Branches
-/// without a `/` group under their own name; a detached HEAD groups separately.
-pub fn workbranch_label(branch: Option<&str>) -> String {
-    match branch {
-        None => "(detached)".to_string(),
-        Some(b) => match b.split_once('/') {
-            Some((head, _)) if !head.is_empty() => head.to_string(),
-            _ => b.to_string(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,15 +140,5 @@ mod tests {
         assert_eq!(basename(r"C:\Users\u\git\myrepo"), "myrepo");
         assert_eq!(basename("/home/u/git/myrepo/"), "myrepo");
         assert_eq!(basename("myrepo"), "myrepo");
-    }
-
-    #[test]
-    fn workbranch_groups_by_top_segment() {
-        assert_eq!(workbranch_label(Some("emmett/wb-2026-06-08")), "emmett");
-        assert_eq!(workbranch_label(Some("feat/csv-export-142")), "feat");
-        assert_eq!(workbranch_label(Some("main")), "main");
-        assert_eq!(workbranch_label(None), "(detached)");
-        // A leading slash shouldn't yield an empty group.
-        assert_eq!(workbranch_label(Some("/weird")), "/weird");
     }
 }

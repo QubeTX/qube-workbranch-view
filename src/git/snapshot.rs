@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use super::commands::git_stdout;
 use super::refs::{BranchInfo, FOR_EACH_REF_FORMAT, parse_refs};
 use super::repo::RepoIdentity;
-use super::status::parse_status_v2;
+use super::status::{ChangeKind, FileChange, WorktreeStatus, parse_status_v2};
 use super::worktree::{WorktreeRecord, parse_worktrees};
 use crate::collision::Collision;
 use crate::process::ProcessSnapshot;
@@ -15,7 +15,8 @@ use crate::util::paths::normalize;
 /// Max concurrent Git subprocesses during a capture (handoff §21.3).
 const GIT_CONCURRENCY: usize = 4;
 
-/// A point-in-time view of the repository: worktrees, refs, collisions, processes.
+/// A point-in-time view of the repository: worktrees, refs, the derived
+/// branch hierarchy, collisions, processes.
 #[derive(Debug, Clone)]
 pub struct RepoSnapshot {
     pub repo: RepoIdentity,
@@ -23,8 +24,13 @@ pub struct RepoSnapshot {
     pub base: Option<String>,
     pub worktrees: Vec<WorktreeRecord>,
     pub branches: Vec<BranchInfo>,
+    /// The derived branch tree (trunk → workbranches → tasks), with per-branch
+    /// lifecycle and worktree attachment.
+    pub hierarchy: super::hierarchy::BranchHierarchy,
     pub collisions: Vec<Collision>,
     pub processes: ProcessSnapshot,
+    /// Epoch seconds when this capture completed (drives staleness chips).
+    pub captured_at: u64,
 }
 
 impl RepoSnapshot {
@@ -51,6 +57,12 @@ impl RepoSnapshot {
         let branches = parse_refs(&ref_bytes);
         let base = detect_base(&branches);
 
+        // The hierarchy skeleton (topology + parentage) — one cached rev-list,
+        // run serially here so the per-worktree stream below keeps the git
+        // concurrency cap intact. Worktree indices and lifecycle are resolved
+        // after statuses land.
+        let hierarchy = super::hierarchy::compute(&repo, &branches).await;
+
         // Collect owned (index, path) jobs first so the async tasks borrow
         // nothing from `worktrees` — keeping the capture future `Send + 'static`
         // for `tokio::spawn`.
@@ -61,8 +73,10 @@ impl RepoSnapshot {
             .map(|(idx, wt)| (idx, std::path::PathBuf::from(&wt.path)))
             .collect();
 
-        // Per-worktree status + touched-file sets, with bounded concurrency so a
-        // repo with many worktrees doesn't serialize a long chain of git calls.
+        // Per-worktree status + committed-since-base files, with bounded
+        // concurrency so a repo with many worktrees doesn't serialize a long
+        // chain of git calls. Working-tree changes come from the status parse
+        // itself — no separate diff calls needed for them.
         let per_worktree = futures_util::stream::iter(jobs.into_iter().map(|(idx, path)| {
             let base = base.clone();
             async move {
@@ -78,19 +92,23 @@ impl RepoSnapshot {
                             None
                         }
                     };
-                let touched = super::diff::touched_files(&path, base.as_deref()).await;
-                (idx, status, touched)
+                let committed = match base.as_deref() {
+                    Some(base) => super::diff::committed_files(&path, base).await,
+                    None => Vec::new(),
+                };
+                (idx, status, committed)
             }
         }))
         .buffer_unordered(GIT_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
 
-        for (idx, status, touched) in per_worktree {
+        for (idx, status, committed) in per_worktree {
+            worktrees[idx].touched = merge_touched(status.as_ref(), committed);
             worktrees[idx].status = status;
-            worktrees[idx].touched = touched;
         }
 
+        let hierarchy = hierarchy.finalize(&branches, &worktrees);
         let collisions = crate::collision::compute(&worktrees);
 
         // Map OS processes to worktrees (sync sysinfo scan, off the executor).
@@ -104,8 +122,10 @@ impl RepoSnapshot {
             base,
             worktrees,
             branches,
+            hierarchy,
             collisions,
             processes,
+            captured_at: crate::storage::events::epoch_secs(),
         })
     }
 
@@ -126,9 +146,33 @@ impl RepoSnapshot {
     }
 }
 
-/// Pick a base branch for "committed since base" comparisons: the first of
-/// `origin/main`, `origin/master`, `main`, `master` that exists.
+/// Union of a worktree's working-tree changes and its committed-since-base
+/// files, keyed by path. The working-tree kind wins (it is the current state).
+/// Sorted by path, de-duplicated.
+fn merge_touched(status: Option<&WorktreeStatus>, committed: Vec<FileChange>) -> Vec<FileChange> {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, ChangeKind> =
+        committed.into_iter().map(|f| (f.path, f.kind)).collect();
+    if let Some(s) = status {
+        for f in &s.changes {
+            by_path.insert(f.path.clone(), f.kind);
+        }
+    }
+    by_path
+        .into_iter()
+        .map(|(path, kind)| FileChange { path, kind })
+        .collect()
+}
+
+/// Pick a base branch for "committed since base" comparisons: the remote
+/// default branch (the `origin/HEAD` symref target) when present, else the
+/// first of `origin/main`, `origin/master`, `main`, `master` that exists.
 fn detect_base(branches: &[BranchInfo]) -> Option<String> {
+    if let Some(target) = branches.iter().find_map(|b| b.symref_target.as_deref())
+        && branches.iter().any(|b| b.short == target)
+    {
+        return Some(target.to_string());
+    }
     const PREFERRED: &[&str] = &["origin/main", "origin/master", "main", "master"];
     PREFERRED
         .iter()

@@ -1,9 +1,16 @@
 # WB-300 Handoff Plan
 
+> **⚠ HISTORICAL (v1) DESIGN DOCUMENT.** This plan was written under a wrong mental model —
+> that one branch can have many simultaneous worktrees. Git allows a branch to be checked out
+> in at most ONE worktree; the v2 rework (≥ 2.0.0) rebuilt the product around the real branch
+> hierarchy. The current design source of truth is **`WB-300_V2_DESIGN.md`** — where the two
+> documents conflict, V2 wins. This file is kept as the v1 record (architecture invariants,
+> phase history, and rationale that still apply are restated in V2).
+
 **Executable:** `wb300`  
 **Working name:** WB-300  
 **Document purpose:** handoff plan for Claude Code or another coding agent to continue product planning and implementation.  
-**Status:** planning/design handoff.  
+**Status:** superseded by `WB-300_V2_DESIGN.md` (kept as the v1 historical record).  
 **Last updated:** 2026-06-08.
 
 ---
