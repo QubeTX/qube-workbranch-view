@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::snapshot::{HomeSnapshot, repo_key};
-use crate::app::state::{branch_events, change_kind, note_activity_tree, wt_flash_key};
+use crate::app::state::{
+    branch_events, change_kind, conflict_events, note_activity_tree, wt_flash_key,
+};
 use crate::app::tree::{NodeId, TreeRow, TreeState, flatten};
 use crate::app::{LiveStatus, TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
@@ -196,6 +198,10 @@ impl HomeState {
                 collect_repo_transitions(&rkey, old_repo, new_repo, &mut notes);
                 let name = super::snapshot::repo_name(new_repo);
                 events.extend(branch_events(old_repo, new_repo, Some(&name)));
+                for mut ev in conflict_events(old_repo, new_repo) {
+                    ev.repo = Some(name.clone());
+                    events.push(ev);
+                }
             }
         }
         for (key, seq) in notes {

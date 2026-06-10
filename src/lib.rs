@@ -9,9 +9,11 @@ pub mod app;
 pub mod cleanup;
 pub mod cli;
 pub mod collision;
+pub mod config;
 pub mod git;
 pub mod home;
 pub mod live;
+pub mod notifications;
 pub mod process;
 pub mod storage;
 pub mod terminal;
@@ -100,9 +102,19 @@ pub async fn run(cli: Cli) -> Result<()> {
         mouse: false,
     };
     let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
-    let result = run_loop(&mut terminal, snapshot, cli.no_live).await;
+    let result = run_loop(&mut terminal, snapshot, cli.no_live, effective_notify(&cli)).await;
     guard.restore();
     result
+}
+
+/// The notification config for this run: the user's config file, with the
+/// master switch forced off by `--no-notify`.
+fn effective_notify(cli: &Cli) -> config::NotifyConfig {
+    let mut cfg = config::load().notifications;
+    if cli.no_notify {
+        cfg.enabled = false;
+    }
+    cfg
 }
 
 /// The render/input loop: a `tokio::select!` over terminal input, debounced
@@ -113,9 +125,15 @@ async fn run_loop(
     terminal: &mut terminal::Tui,
     snapshot: git::RepoSnapshot,
     no_live: bool,
+    notify_cfg: config::NotifyConfig,
 ) -> Result<()> {
     let repo = snapshot.repo.clone();
     let mut app = AppState::new(snapshot);
+
+    // OS toast notifications: events flow reducer → loop → notifier task.
+    // `try_send` everywhere — a dropped toast is fine, a blocked UI is not.
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<notifications::NotifyEvent>(64);
+    let _notifier = notifications::spawn_notifier(notify_cfg, notify_rx);
 
     // Load + prune (age + cap) the persisted Timeline, then keep one writer
     // thread that owns the file for ordered, non-interleaved appends.
@@ -207,7 +225,11 @@ async fn run_loop(
                 match result {
                     Some(snapshot) => {
                         app.set_stale(false);
+                        let repo_label = home::repo_name(&snapshot);
                         for event in app.ingest_snapshot(snapshot) {
+                            if let Some(n) = notifications::from_archived(&event, &repo_label) {
+                                let _ = notify_tx.try_send(n);
+                            }
                             let _ = event_writer.send(event);
                         }
                     }
@@ -393,7 +415,14 @@ async fn run_home_entry(cli: &Cli) -> Result<()> {
         mouse: false,
     };
     let (mut guard, mut terminal) = terminal::TerminalGuard::enter(options)?;
-    let result = run_home_loop(&mut terminal, config, snapshot, cli.no_live).await;
+    let result = run_home_loop(
+        &mut terminal,
+        config,
+        snapshot,
+        cli.no_live,
+        effective_notify(cli),
+    )
+    .await;
     guard.restore();
     result
 }
@@ -408,9 +437,14 @@ async fn run_home_loop(
     config: home::HomeConfig,
     snapshot: home::HomeSnapshot,
     no_live: bool,
+    notify_cfg: config::NotifyConfig,
 ) -> Result<()> {
     let config = std::sync::Arc::new(config);
     let mut home = home::HomeState::new(snapshot);
+
+    // Machine-wide toasts: every matched repo's milestones flow through here.
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::channel::<notifications::NotifyEvent>(64);
+    let _notifier = notifications::spawn_notifier(notify_cfg.clone(), notify_rx);
 
     let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<home::HomeSnapshot>(4);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(8);
@@ -470,14 +504,19 @@ async fn run_home_loop(
             _ = anim.tick() => home.expire_transitions(),
             Some(snapshot) = snap_rx.recv() => {
                 in_flight = false;
-                home.ingest_snapshot(snapshot);
+                for event in home.ingest_snapshot(snapshot) {
+                    // Home events arrive repo-stamped; no fallback label needed.
+                    if let Some(n) = notifications::from_archived(&event, "") {
+                        let _ = notify_tx.try_send(n);
+                    }
+                }
             }
         }
 
         // Drill-in: hand the terminal to the per-repo view for the selected
         // repo, then return to the home view and rescan to pick up any change.
         if let Some(repo_snapshot) = home.take_drill_in() {
-            run_loop(terminal, repo_snapshot, no_live).await?;
+            run_loop(terminal, repo_snapshot, no_live, notify_cfg.clone()).await?;
             // While drilled in, the home `select!` wasn't draining `refresh_rx`,
             // so the fs-watch debouncer may have queued a backlog. Drain it (and
             // unblock the debouncer) so we do one fresh rescan, not a burst.

@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    // Disable OS toast notifications for this run (overrides the config file).
+    #[arg(long)]
+    pub no_notify: bool,
+
     // Print the selected worktree path on exit (for shell `cd` integration).
     #[arg(long)]
     pub print_selected_path: bool,
