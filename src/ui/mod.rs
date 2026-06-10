@@ -239,8 +239,10 @@ mod render_tests {
             base: None,
             worktrees,
             branches: Vec::new(),
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 

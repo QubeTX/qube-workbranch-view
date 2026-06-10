@@ -10,8 +10,15 @@ use serde::{Deserialize, Serialize};
 pub enum EventKind {
     WorktreeCreated,
     WorktreeRemoved,
-    /// A file became changed on a 2nd worktree — a new merge-conflict risk.
+    /// A file became changed on a 2nd branch's worktree — a new
+    /// merge-conflict risk.
     ConflictRisk,
+    /// A branch's tip moved — a commit landed (rebases are suppressed).
+    BranchCommitted,
+    /// A branch's work fully reached its live upstream.
+    BranchPushed,
+    /// A branch became contained in its parent (or vanished after merging).
+    BranchMerged,
 }
 
 impl EventKind {
@@ -20,6 +27,9 @@ impl EventKind {
             EventKind::WorktreeCreated => "created",
             EventKind::WorktreeRemoved => "removed",
             EventKind::ConflictRisk => "conflict-risk",
+            EventKind::BranchCommitted => "committed",
+            EventKind::BranchPushed => "pushed",
+            EventKind::BranchMerged => "merged",
         }
     }
 }
@@ -50,6 +60,15 @@ pub struct ArchivedEvent {
     pub head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty: Option<DirtySummary>,
+    /// Parent branch in the hierarchy, for branch milestone events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Repo display name — stamped in machine-wide (home) mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// A few touched paths (≤ 10) carried with commit milestones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
     /// Unix epoch seconds when the event was observed.
     pub at_epoch: u64,
 }
@@ -69,6 +88,9 @@ impl ArchivedEvent {
             branch,
             head,
             dirty,
+            parent: None,
+            repo: None,
+            files: None,
             at_epoch: epoch_secs(),
         }
     }

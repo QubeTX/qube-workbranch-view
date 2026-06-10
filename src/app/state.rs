@@ -315,6 +315,9 @@ impl AppState {
                     ));
                 }
             }
+            // Branch milestones (commit / push / merge), diffed on the
+            // hierarchy. These feed the Timeline and OS notifications.
+            new_events.extend(branch_events(&self.snapshot, &new, None));
         }
 
         for (path, seq) in notes {
@@ -812,6 +815,106 @@ pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Vec<Tra
     Vec::new()
 }
 
+/// Max touched paths carried with a commit-milestone event.
+const EVENT_FILES_CAP: usize = 10;
+
+/// Diff two snapshots' branch hierarchies into milestone events: a commit
+/// (tip moved — rebases suppressed), a push (lifecycle reached `Pushed`), a
+/// merge (lifecycle reached `Merged`, or the branch vanished after merging).
+/// `repo` stamps the events in machine-wide mode.
+pub(crate) fn branch_events(
+    old: &RepoSnapshot,
+    new: &RepoSnapshot,
+    repo: Option<&str>,
+) -> Vec<ArchivedEvent> {
+    use crate::git::BranchLifecycle;
+    let old_by_name: HashMap<&str, &crate::git::BranchNode> = old
+        .hierarchy
+        .nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n))
+        .collect();
+    let mut out = Vec::new();
+
+    for n in &new.hierarchy.nodes {
+        // Brand-new branches don't fire milestones; their appearance is
+        // already covered by the worktree-created event/flash.
+        let Some(o) = old_by_name.get(n.name.as_str()) else {
+            continue;
+        };
+        let path = n
+            .worktree
+            .and_then(|i| new.worktrees.get(i))
+            .map(|w| w.path.clone())
+            .unwrap_or_default();
+        let mk = |kind: EventKind| {
+            let mut ev = ArchivedEvent::new(
+                kind,
+                path.clone(),
+                Some(n.name.clone()),
+                Some(n.oid.chars().take(8).collect()),
+                None,
+            );
+            ev.parent = n.parent.clone();
+            ev.repo = repo.map(str::to_string);
+            ev
+        };
+
+        // A rebase moves the tip without new work: ahead-of-parent didn't
+        // grow and behind-parent drained to zero (the parent moved under us).
+        // Heuristic in the same spirit as `change_kind`'s documented limits.
+        let rebase_signature = n.ahead_of_parent <= o.ahead_of_parent
+            && o.behind_parent.is_some_and(|b| b > 0)
+            && n.behind_parent == Some(0);
+        if o.oid != n.oid && !rebase_signature {
+            let mut ev = mk(EventKind::BranchCommitted);
+            ev.files = n.worktree.and_then(|i| new.worktrees.get(i)).map(|w| {
+                w.touched
+                    .iter()
+                    .take(EVENT_FILES_CAP)
+                    .map(|f| f.path.clone())
+                    .collect()
+            });
+            out.push(ev);
+        }
+        if o.lifecycle != BranchLifecycle::Pushed && n.lifecycle == BranchLifecycle::Pushed {
+            out.push(mk(EventKind::BranchPushed));
+        }
+        if o.lifecycle != BranchLifecycle::Merged && n.lifecycle == BranchLifecycle::Merged {
+            out.push(mk(EventKind::BranchMerged));
+        }
+    }
+
+    // A branch that vanished while merged/pushed completed its lifecycle —
+    // fold the deletion into a merge milestone.
+    let new_names: HashSet<&str> = new
+        .hierarchy
+        .nodes
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect();
+    for o in &old.hierarchy.nodes {
+        if !new_names.contains(o.name.as_str())
+            && matches!(
+                o.lifecycle,
+                crate::git::BranchLifecycle::Merged | crate::git::BranchLifecycle::Pushed
+            )
+        {
+            let mut ev = ArchivedEvent::new(
+                EventKind::BranchMerged,
+                String::new(),
+                Some(o.name.clone()),
+                Some(o.oid.chars().take(8).collect()),
+                None,
+            );
+            ev.parent = o.parent.clone();
+            ev.repo = repo.map(str::to_string);
+            out.push(ev);
+        }
+    }
+    out
+}
+
 /// Flash a blue `Activity` marker on the worktree containing each changed path.
 /// Driven by the (un-debounced) filesystem watcher so the marker tracks live
 /// save state. Paths that fall outside every known worktree are ignored. Shared
@@ -856,8 +959,10 @@ mod tests {
             worktrees,
             branches: Vec::new(),
             base: None,
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -954,8 +1059,10 @@ mod tests {
             worktrees,
             branches: Vec::new(),
             base: None,
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -1089,6 +1196,116 @@ mod tests {
             change_kind(&old, &new),
             vec![TransitionKind::Committed, TransitionKind::Pushed]
         );
+    }
+
+    fn bnode(
+        name: &str,
+        oid: &str,
+        lifecycle: crate::git::BranchLifecycle,
+    ) -> crate::git::BranchNode {
+        crate::git::BranchNode {
+            name: name.to_string(),
+            oid: oid.to_string(),
+            role: crate::git::BranchRole::Task,
+            parent: Some("emmett/wb-2026-06-10".to_string()),
+            ahead_of_parent: 1,
+            behind_parent: Some(0),
+            merged_into_parent: false,
+            upstream: None,
+            ahead: None,
+            behind: None,
+            upstream_gone: false,
+            committer_date: None,
+            lifecycle,
+            worktree: None,
+        }
+    }
+
+    fn snap_with_nodes(nodes: Vec<crate::git::BranchNode>) -> RepoSnapshot {
+        let mut s = snapshot_paths(&[]);
+        s.hierarchy = crate::git::BranchHierarchy {
+            trunk: Some("main".to_string()),
+            nodes,
+            approximate: false,
+        };
+        s
+    }
+
+    #[test]
+    fn branch_commit_milestone_on_tip_move() {
+        use crate::git::BranchLifecycle::Committed;
+        let old = snap_with_nodes(vec![bnode("feat/x", "aaaa", Committed)]);
+        let new = snap_with_nodes(vec![bnode("feat/x", "bbbb", Committed)]);
+        let events = branch_events(&old, &new, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::BranchCommitted);
+        assert_eq!(events[0].branch.as_deref(), Some("feat/x"));
+        assert_eq!(events[0].parent.as_deref(), Some("emmett/wb-2026-06-10"));
+    }
+
+    #[test]
+    fn rebase_does_not_fire_a_commit_milestone() {
+        use crate::git::BranchLifecycle::Committed;
+        // Tip moved, but ahead didn't grow and behind-parent drained to 0:
+        // the parent moved under us (a rebase), not new work.
+        let mut before = bnode("feat/x", "aaaa", Committed);
+        before.behind_parent = Some(2);
+        let after = bnode("feat/x", "bbbb", Committed);
+        let events = branch_events(
+            &snap_with_nodes(vec![before]),
+            &snap_with_nodes(vec![after]),
+            None,
+        );
+        assert!(events.is_empty(), "a rebase is not a commit milestone");
+    }
+
+    #[test]
+    fn push_and_merge_milestones_on_lifecycle_transitions() {
+        use crate::git::BranchLifecycle::{Committed, Merged, Pushed};
+        let old = snap_with_nodes(vec![
+            bnode("feat/p", "aaaa", Committed),
+            bnode("feat/m", "cccc", Pushed),
+        ]);
+        let new = snap_with_nodes(vec![
+            bnode("feat/p", "aaaa", Pushed),
+            bnode("feat/m", "cccc", Merged),
+        ]);
+        let events = branch_events(&old, &new, None);
+        let kinds: Vec<(EventKind, &str)> = events
+            .iter()
+            .map(|e| (e.kind, e.branch.as_deref().unwrap_or("")))
+            .collect();
+        assert!(kinds.contains(&(EventKind::BranchPushed, "feat/p")));
+        assert!(kinds.contains(&(EventKind::BranchMerged, "feat/m")));
+        assert_eq!(events.len(), 2, "steady branches stay quiet");
+    }
+
+    #[test]
+    fn vanished_merged_branch_folds_into_a_merge_milestone() {
+        use crate::git::BranchLifecycle::{Committed, Merged};
+        let old = snap_with_nodes(vec![
+            bnode("feat/done", "aaaa", Merged),
+            bnode("feat/wip", "bbbb", Committed),
+        ]);
+        // feat/done deleted after merge; feat/wip deleted prematurely.
+        let new = snap_with_nodes(vec![]);
+        let events = branch_events(&old, &new, Some("myrepo"));
+        assert_eq!(
+            events.len(),
+            1,
+            "only the merged branch folds into an event"
+        );
+        assert_eq!(events[0].kind, EventKind::BranchMerged);
+        assert_eq!(events[0].branch.as_deref(), Some("feat/done"));
+        assert_eq!(events[0].repo.as_deref(), Some("myrepo"));
+    }
+
+    #[test]
+    fn brand_new_branch_fires_no_milestone() {
+        use crate::git::BranchLifecycle::Committed;
+        let old = snap_with_nodes(vec![]);
+        let new = snap_with_nodes(vec![bnode("feat/new", "aaaa", Committed)]);
+        assert!(branch_events(&old, &new, None).is_empty());
     }
 
     #[test]

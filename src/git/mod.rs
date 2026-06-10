@@ -6,6 +6,8 @@
 
 pub mod commands;
 pub mod diff;
+pub mod hierarchy;
+pub mod lifecycle;
 pub mod ops;
 pub mod refs;
 pub mod repo;
@@ -13,6 +15,8 @@ pub mod snapshot;
 pub mod status;
 pub mod worktree;
 
+pub use hierarchy::{BranchHierarchy, BranchNode, BranchRole};
+pub use lifecycle::BranchLifecycle;
 pub use refs::BranchInfo;
 pub use repo::RepoIdentity;
 pub use snapshot::RepoSnapshot;

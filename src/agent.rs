@@ -324,8 +324,10 @@ mod tests {
                 },
             ],
             branches: Vec::new(),
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 

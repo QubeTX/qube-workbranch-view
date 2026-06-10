@@ -10,10 +10,11 @@ use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::snapshot::{HomeSnapshot, repo_key};
-use crate::app::state::change_kind;
+use super::snapshot::{HomeSnapshot, repo_key, repo_name};
+use crate::app::state::{branch_events, change_kind};
 use crate::app::{LiveStatus, TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
+use crate::storage::ArchivedEvent;
 
 /// What a key press means in the home view. A small local enum — the per-repo
 /// `Action` set (overlays, fetch, remove, …) doesn't apply here.
@@ -152,7 +153,10 @@ impl HomeState {
     /// Swap in a freshly captured machine-wide snapshot, raising per-worktree
     /// flashes for repos seen in the previous scan (created / modified / pushed
     /// / deleted). New repos don't flash every worktree on first sight.
-    pub fn ingest_snapshot(&mut self, new: HomeSnapshot) {
+    /// Returns branch milestone events (commit / push / merge) across all
+    /// matched repos, each stamped with its repo name — the machine-wide feed
+    /// for notifications.
+    pub fn ingest_snapshot(&mut self, new: HomeSnapshot) -> Vec<ArchivedEvent> {
         let old_by_key: HashMap<String, &RepoSnapshot> = self
             .snapshot
             .repos
@@ -161,9 +165,12 @@ impl HomeState {
             .collect();
 
         let mut notes: Vec<(String, Vec<TransitionKind>)> = Vec::new();
+        let mut events: Vec<ArchivedEvent> = Vec::new();
         for new_repo in &new.repos {
             if let Some(old_repo) = old_by_key.get(&repo_key(new_repo)) {
                 collect_repo_transitions(old_repo, new_repo, &mut notes);
+                let name = repo_name(new_repo);
+                events.extend(branch_events(old_repo, new_repo, Some(&name)));
             }
         }
         for (path, seq) in notes {
@@ -172,6 +179,7 @@ impl HomeState {
 
         self.snapshot = new;
         self.clamp_selection();
+        events
     }
 
     fn clamp_selection(&mut self) {
@@ -236,8 +244,10 @@ mod tests {
             base: None,
             worktrees,
             branches: Vec::new(),
+            hierarchy: Default::default(),
             collisions: Vec::new(),
             processes: ProcessSnapshot::default(),
+            captured_at: 0,
         }
     }
 
@@ -303,7 +313,7 @@ mod tests {
     fn ingest_flashes_created_and_deleted_within_a_known_repo() {
         let mut s = HomeState::new(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-x")])]));
         // Same repo (same common dir), feat-x removed and feat-y added.
-        s.ingest_snapshot(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-y")])]));
+        let _ = s.ingest_snapshot(home(vec![repo("/a", vec![wt("/a/root"), wt("/a/feat-y")])]));
         assert_eq!(s.transition_for("/a/feat-y"), Some(TransitionKind::Created));
         assert_eq!(s.transition_for("/a/feat-x"), Some(TransitionKind::Deleted));
     }
