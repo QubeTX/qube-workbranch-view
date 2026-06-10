@@ -26,8 +26,8 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
                      was found, so cross-branch overlap can't be compared."
             }
             Some(_) => {
-                "No merge-conflict risk — no file has been changed on two worktrees, so \
-                        nothing should conflict when these branches merge back."
+                "No merge-conflict risk — no file has been changed on two branches, so \
+                        nothing should conflict when they merge back."
             }
         };
         render_placeholder(frame, area, "Merge Conflict Risk", note);
@@ -36,7 +36,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
 
     let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(
         Span::from(format!(
-            "Files changed on 2+ worktrees — likely to conflict when merged{}:",
+            "Files changed on 2+ branches — likely to conflict when merged{}:",
             base.map_or_else(String::new, |b| format!(" into {b}"))
         ))
         .fg(theme::DIM),
