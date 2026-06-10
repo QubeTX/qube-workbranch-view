@@ -10,7 +10,7 @@ use super::overlay::{
     Command, Confirm, ConfirmAction, Overlay, Palette, PendingGit, PendingKill, palette_filtered,
 };
 use super::transitions::{TransitionKind, Transitions};
-use super::tree::{NodeId, RowKind, TreeRow, TreeState, flatten};
+use super::tree::{NodeId, RowKind, TreeRow, TreeState, flatten, live_ids};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 use crate::storage::{ArchivedEvent, DirtySummary, EventKind};
 
@@ -199,13 +199,15 @@ impl AppState {
     /// disjoint field borrows so `self.tree` stays mutable while the rows
     /// borrow `self.snapshot`.)
     fn refresh_tree_selection(&mut self) {
+        // Prune overrides against node EXISTENCE (never visibility — a
+        // collapsed/filtered/inactive node still exists and keeps its fold).
+        self.tree
+            .retain_ids(&live_ids(std::slice::from_ref(&self.snapshot)));
         let rows = flatten(
             std::slice::from_ref(&self.snapshot),
             &self.tree,
             self.filter.as_deref(),
         );
-        let live: HashSet<NodeId> = rows.iter().map(|r| r.id.clone()).collect();
-        self.tree.retain_ids(&live);
         if let Some(i) = self.tree.selected_index(&rows) {
             self.tree.select_index(&rows, i);
         } else {
@@ -466,13 +468,18 @@ impl AppState {
                 Tab::Processes => Action::RequestKillProcess,
                 _ => Action::RequestKillAgent,
             },
+            // Selection movement only where a selection is VISIBLE — on other
+            // tabs j/k must not silently retarget the hidden tree selection
+            // that x/K/p act on.
             KeyCode::Char('j') | KeyCode::Down => match self.active_tab {
                 Tab::Processes => Action::ProcessDown,
-                _ => Action::MoveDown,
+                Tab::Branches => Action::MoveDown,
+                _ => Action::None,
             },
             KeyCode::Char('k') | KeyCode::Up => match self.active_tab {
                 Tab::Processes => Action::ProcessUp,
-                _ => Action::MoveUp,
+                Tab::Branches => Action::MoveUp,
+                _ => Action::None,
             },
             KeyCode::Char('l') | KeyCode::Right if self.active_tab == Tab::Branches => {
                 Action::Expand
@@ -569,6 +576,11 @@ impl AppState {
             if len > 0 {
                 p.selected = (p.selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
             }
+            return;
+        }
+        // Arrows while a Confirm dialog is open must not move the tree
+        // selection behind the operator's back.
+        if matches!(self.overlay, Overlay::Confirm(_)) {
             return;
         }
         let rows = flatten(
@@ -956,7 +968,9 @@ pub(crate) fn branch_events(
 
         // A rebase moves the tip without new work: ahead-of-parent didn't
         // grow and behind-parent drained to zero (the parent moved under us).
-        // Heuristic in the same spirit as `change_kind`'s documented limits.
+        // Heuristic limits (accepted): an --amend/reword while already level
+        // with the parent still reads as a commit (the cooldown bounds the
+        // noise), and a reset-to-parent on a diverged branch is suppressed.
         let rebase_signature = n.ahead_of_parent <= o.ahead_of_parent
             && o.behind_parent.is_some_and(|b| b > 0)
             && n.behind_parent == Some(0);
@@ -979,8 +993,10 @@ pub(crate) fn branch_events(
         }
     }
 
-    // A branch that vanished while merged/pushed completed its lifecycle —
-    // fold the deletion into a merge milestone.
+    // A branch that vanished while MERGED completed its lifecycle — fold the
+    // deletion into a merge milestone. Pushed-but-never-merged branches are
+    // deliberately excluded: deleting (or renaming) an abandoned pushed
+    // branch is not a merge.
     let new_names: HashSet<&str> = new
         .hierarchy
         .nodes
@@ -989,10 +1005,7 @@ pub(crate) fn branch_events(
         .collect();
     for o in &old.hierarchy.nodes {
         if !new_names.contains(o.name.as_str())
-            && matches!(
-                o.lifecycle,
-                crate::git::BranchLifecycle::Merged | crate::git::BranchLifecycle::Pushed
-            )
+            && o.lifecycle == crate::git::BranchLifecycle::Merged
         {
             let mut ev = ArchivedEvent::new(
                 EventKind::BranchMerged,

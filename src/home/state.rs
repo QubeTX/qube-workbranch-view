@@ -13,7 +13,7 @@ use super::snapshot::{HomeSnapshot, repo_key};
 use crate::app::state::{
     branch_events, change_kind, conflict_events, note_activity_tree, wt_flash_key,
 };
-use crate::app::tree::{NodeId, TreeRow, TreeState, flatten};
+use crate::app::tree::{NodeId, TreeRow, TreeState, flatten, live_ids};
 use crate::app::{LiveStatus, TransitionKind, Transitions};
 use crate::git::{RepoSnapshot, WorktreeRecord};
 use crate::storage::ArchivedEvent;
@@ -216,9 +216,10 @@ impl HomeState {
     /// Re-resolve the selection and prune expansion state after the snapshot
     /// (or the active-only scope) changed.
     fn refresh_tree_selection(&mut self) {
+        // Prune overrides against node EXISTENCE (never visibility — a
+        // collapsed/filtered/inactive node still exists and keeps its fold).
+        self.tree.retain_ids(&live_ids(&self.snapshot.repos));
         let rows = flatten(&self.snapshot.repos, &self.tree, None);
-        let live: HashSet<NodeId> = rows.iter().map(|r| r.id.clone()).collect();
-        self.tree.retain_ids(&live);
         if let Some(i) = self.tree.selected_index(&rows) {
             self.tree.select_index(&rows, i);
         } else {

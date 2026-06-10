@@ -70,6 +70,9 @@ pub struct BranchNode {
     pub ahead_of_parent: u32,
     /// Commits on the parent not reachable from this branch ("needs rebase"
     /// when > 0). `None` when the bounded extra query was skipped or failed.
+    /// For direct trunk children this is measured against the REMOTE trunk tip
+    /// (the rebase target under the team flow), which can differ from the
+    /// local trunk when local commits haven't been pushed.
     pub behind_parent: Option<u32>,
     /// Fully contained in the parent (and not just a fresh, workless cut).
     pub merged_into_parent: bool,
@@ -138,7 +141,10 @@ impl BranchHierarchy {
 
     /// Resolve each node's worktree index and lifecycle against the captured
     /// worktrees. Called once per snapshot — lifecycle is never cached, since
-    /// statuses change without any oid moving.
+    /// statuses change without any oid moving. Upstream-tracking facts are
+    /// refreshed from the CURRENT ref scan here too: `git branch
+    /// --set-upstream-to`/`--unset-upstream` changes them without moving any
+    /// ref, so the cached skeleton's copies can be stale.
     pub fn finalize(mut self, branches: &[BranchInfo], worktrees: &[WorktreeRecord]) -> Self {
         use crate::util::paths::normalize;
         let wt_by_path: HashMap<String, usize> = worktrees
@@ -146,10 +152,10 @@ impl BranchHierarchy {
             .enumerate()
             .map(|(i, w)| (normalize(&w.path), i))
             .collect();
-        let wt_path_by_branch: HashMap<&str, &str> = branches
+        let local_by_name: HashMap<&str, &BranchInfo> = branches
             .iter()
             .filter(|b| !b.is_remote)
-            .filter_map(|b| Some((b.short.as_str(), b.worktree_path.as_deref()?)))
+            .map(|b| (b.short.as_str(), b))
             .collect();
         let oid_by_name: HashMap<String, String> = self
             .nodes
@@ -158,8 +164,15 @@ impl BranchHierarchy {
             .collect();
 
         for node in &mut self.nodes {
-            node.worktree = wt_path_by_branch
-                .get(node.name.as_str())
+            let info = local_by_name.get(node.name.as_str());
+            if let Some(info) = info {
+                node.upstream = info.upstream.clone();
+                node.ahead = info.ahead;
+                node.behind = info.behind;
+                node.upstream_gone = info.upstream_gone;
+            }
+            node.worktree = info
+                .and_then(|b| b.worktree_path.as_deref())
                 .and_then(|p| wt_by_path.get(&normalize(p)))
                 .copied();
             let dirty = node
@@ -218,8 +231,18 @@ pub async fn compute(repo: &RepoIdentity, branches: &[BranchInfo]) -> BranchHier
             };
             match fetch_graph(&repo.root, &tip_oids, &trunk.boundary_oid).await {
                 Ok(graph) => {
+                    // A walk that filled the cap was almost certainly
+                    // truncated: reach sets (and therefore parents and
+                    // ahead-counts) may be wrong, so say so.
+                    let capped = graph.len() >= MAX_TOPOLOGY_COMMITS;
+                    if capped {
+                        tracing::warn!(
+                            "off-trunk history hit the {MAX_TOPOLOGY_COMMITS}-commit cap — \
+                             hierarchy marked approximate"
+                        );
+                    }
                     let mut sk =
-                        build_skeleton(&tips, Some(trunk.local_short.as_str()), &graph, false);
+                        build_skeleton(&tips, Some(trunk.local_short.as_str()), &graph, capped);
                     fill_trunk_child_behind(repo, &mut sk, &trunk.boundary_oid).await;
                     sk
                 }
@@ -253,10 +276,15 @@ struct TrunkInfo {
 /// `refs/remotes/origin/HEAD` symref target) when a matching LOCAL branch
 /// exists, else `main`, else `master`.
 fn detect_trunk(branches: &[BranchInfo]) -> Option<TrunkInfo> {
+    // Prefer origin's HEAD symref specifically when several remotes carry one,
+    // and take the LAST path segment — remote names may themselves contain
+    // slashes (`work/origin/main` → branch `main`).
     let symref_local = branches
         .iter()
-        .find_map(|b| b.symref_target.as_deref())
-        .and_then(|t| t.split_once('/').map(|(_, name)| name.to_string()));
+        .filter(|b| b.symref_target.is_some())
+        .min_by_key(|b| b.full_ref != "refs/remotes/origin/HEAD")
+        .and_then(|b| b.symref_target.as_deref())
+        .and_then(|t| t.rsplit_once('/').map(|(_, name)| name.to_string()));
     let candidates: Vec<String> = symref_local
         .into_iter()
         .chain(["main".to_string(), "master".to_string()])
@@ -452,10 +480,79 @@ fn build_skeleton(
         });
     }
 
+    break_cycles(&mut nodes, trunk, &reaches);
     BranchHierarchy {
         trunk: trunk.map(str::to_string),
         nodes: depth_first(nodes, trunk),
         approximate,
+    }
+}
+
+/// Defensive backstop: parent pointers must form a forest. The selection
+/// rules cannot produce a cycle (rule 1 refuses to parent a wb-named branch
+/// under a non-wb branch, and a DAG can't make two distinct tips mutual
+/// ancestors), but a future rule change could — and a cycle silently drops
+/// its members from the tree. Detect any cycle and cut it at its wb-named
+/// (else first-seen) member, reattaching that member to trunk.
+fn break_cycles(
+    nodes: &mut [BranchNode],
+    trunk: Option<&str>,
+    reaches: &HashMap<&str, HashSet<&str>>,
+) {
+    let index_of: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.name.clone(), i))
+        .collect();
+    let mut cleared: HashSet<usize> = HashSet::new(); // known cycle-free
+    for start in 0..nodes.len() {
+        let mut path: Vec<usize> = Vec::new();
+        let mut on_path: HashSet<usize> = HashSet::new();
+        let mut i = start;
+        loop {
+            if cleared.contains(&i) {
+                break;
+            }
+            if on_path.contains(&i) {
+                // Found a cycle: the members are `path` from `i` onward.
+                let cycle_start = path.iter().position(|&j| j == i).unwrap_or(0);
+                let members = &path[cycle_start..];
+                let cut = members
+                    .iter()
+                    .copied()
+                    .find(|&j| wb_named(&nodes[j].name))
+                    .unwrap_or(members[0]);
+                tracing::warn!(
+                    "branch parent cycle detected ({}); reattaching {} to trunk",
+                    members
+                        .iter()
+                        .map(|&j| nodes[j].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → "),
+                    nodes[cut].name
+                );
+                let rb = &reaches[nodes[cut].name.as_str()];
+                let ahead = match trunk.and_then(|t| reaches.get(t)) {
+                    Some(rt) => rb.difference(rt).count() as u32,
+                    None => rb.len() as u32,
+                };
+                nodes[cut].parent = trunk.map(str::to_string);
+                nodes[cut].ahead_of_parent = ahead;
+                nodes[cut].behind_parent = None;
+                nodes[cut].merged_into_parent = trunk.is_some() && ahead == 0;
+                if !wb_named(&nodes[cut].name) {
+                    nodes[cut].role = BranchRole::Standalone;
+                }
+                break;
+            }
+            on_path.insert(i);
+            path.push(i);
+            match nodes[i].parent.as_ref().and_then(|p| index_of.get(p)) {
+                Some(&next) => i = next,
+                None => break,
+            }
+        }
+        cleared.extend(path);
     }
 }
 
@@ -481,7 +578,18 @@ fn select_parent(
             let p_is_trunk = Some(p.name.as_str()) == trunk;
             (p_is_trunk || (wb_named(&p.name) && !wb_named(&b.name))).then_some(0usize)
         } else if rb.contains(p.oid.as_str()) {
-            Some(rb.len() - reaches[p.name.as_str()].len())
+            // A workbranch that has MERGED one of its task branches sees that
+            // task's tip as a strict ancestor — but the task is simultaneously
+            // parented to the workbranch by the diverged rule, which would
+            // form a parent CYCLE (and drop both from the tree). The
+            // convention is authoritative here: a wb-named branch is never
+            // parented by a non-wb, non-trunk branch.
+            let p_is_trunk = Some(p.name.as_str()) == trunk;
+            if wb_named(&b.name) && !wb_named(&p.name) && !p_is_trunk {
+                None
+            } else {
+                Some(rb.len() - reaches[p.name.as_str()].len())
+            }
         } else {
             None
         };
@@ -874,6 +982,64 @@ mod tests {
         );
         let wb_alone = node(&alone, "emmett/wb-2026-06-10");
         assert!(!alone.is_active(wb_alone));
+    }
+
+    #[test]
+    fn merging_a_task_into_its_workbranch_does_not_cycle() {
+        // The team's own flow: wb merges task via a merge commit. The task's
+        // tip becomes a strict ancestor of the wb — the wb must still parent
+        // to trunk (never to its own task), and the task stays under the wb.
+        //   main(boundary) ← w1(wb base) ← t1(task tip); wb tip = merge w2(w1, t1)
+        let tips = vec![
+            tip("main", "m0"),
+            tip("emmett/wb-2026-06-10", "w2"),
+            tip("feat/x-1", "t1"),
+        ];
+        let g = graph(&[("w1", &["m0"]), ("t1", &["w1"]), ("w2", &["w1", "t1"])]);
+        let h = build_skeleton(&tips, Some("main"), &g, false);
+
+        let wb = node(&h, "emmett/wb-2026-06-10");
+        assert_eq!(
+            wb.parent.as_deref(),
+            Some("main"),
+            "wb must not be parented by its merged task"
+        );
+        let task = node(&h, "feat/x-1");
+        assert_eq!(task.parent.as_deref(), Some("emmett/wb-2026-06-10"));
+        assert!(task.merged_into_parent);
+        // Both rows must be reachable in depth-first order (no silent drop).
+        let names: Vec<&str> = h.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "emmett/wb-2026-06-10", "feat/x-1"]);
+    }
+
+    #[test]
+    fn break_cycles_reattaches_a_forced_cycle_to_trunk() {
+        // Backstop check: hand-build a cycle and confirm it is cut at the
+        // wb-named member and everything stays visible.
+        let tips = vec![
+            tip("main", "m0"),
+            tip("emmett/wb-1", "w1"),
+            tip("feat/a", "a1"),
+        ];
+        let g = graph(&[("w1", &["m0"]), ("a1", &["w1"])]);
+        let mut h = build_skeleton(&tips, Some("main"), &g, false);
+        // Force the cycle the selection rules refuse to produce.
+        for n in &mut h.nodes {
+            if n.name == "emmett/wb-1" {
+                n.parent = Some("feat/a".to_string());
+            }
+        }
+        let reaches: HashMap<&str, HashSet<&str>> = [
+            ("main", reach("m0", &g)),
+            ("emmett/wb-1", reach("w1", &g)),
+            ("feat/a", reach("a1", &g)),
+        ]
+        .into_iter()
+        .collect();
+        let mut nodes = std::mem::take(&mut h.nodes);
+        break_cycles(&mut nodes, Some("main"), &reaches);
+        let wb = nodes.iter().find(|n| n.name == "emmett/wb-1").unwrap();
+        assert_eq!(wb.parent.as_deref(), Some("main"), "cycle cut at the wb");
     }
 
     #[test]

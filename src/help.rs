@@ -37,12 +37,19 @@ impl Style {
 pub fn run(use_colors: bool) -> i32 {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
+    if tty {
+        // Windows pagers (`more.com`) can't be trusted with ANSI on classic
+        // conhost — page plain text there; Unix pagers get colors (less -R).
+        let paged_text = manual(&Style {
+            on: use_colors && !cfg!(windows),
+        });
+        if page(&paged_text) {
+            return 0;
+        }
+    }
     let text = manual(&Style {
         on: use_colors && tty,
     });
-    if tty && page(&text) {
-        return 0;
-    }
     print!("{text}");
     0
 }
@@ -50,7 +57,12 @@ pub fn run(use_colors: bool) -> i32 {
 /// Try to display `text` through a pager. Returns false to fall back to print.
 fn page(text: &str) -> bool {
     let candidates: Vec<(String, Vec<&str>)> = if cfg!(windows) {
-        vec![("more".to_string(), vec![])]
+        // std's PATH search only appends `.exe`, and Windows' pager is
+        // `more.com` — name it explicitly (keep a bare `more` fallback).
+        vec![
+            ("more.com".to_string(), vec![]),
+            ("more".to_string(), vec![]),
+        ]
     } else {
         let mut v = Vec::new();
         if let Ok(pager) = std::env::var("PAGER")

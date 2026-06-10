@@ -74,15 +74,17 @@ pub struct UpdateArgs {
 
 #[derive(Args, Debug)]
 pub struct UninstallArgs {
-    // Skip the confirmation prompt.
-    #[arg(long, short = 'y')]
+    // `help =` attribute strings (not doc comments — see the header note)
+    // describe the destructive flags in --help and the man page.
+    #[arg(long, short = 'y', help = "Skip the confirmation prompt")]
     pub yes: bool,
 
-    // Also remove wb300's state, config, and registry entries (kept by default).
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Also remove wb300's state, config, and registry entries (kept by default)"
+    )]
     pub purge: bool,
 
-    // Emit machine-readable JSON describing the uninstall outcome.
-    #[arg(long)]
+    #[arg(long, help = "Emit machine-readable JSON describing the outcome")]
     pub json: bool,
 }

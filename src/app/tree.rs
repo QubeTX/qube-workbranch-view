@@ -127,6 +127,9 @@ impl TreeState {
     }
 
     /// Drop overrides for nodes that no longer exist (bounded memory).
+    /// `live` must be the EXISTENCE set ([`live_ids`]), never the visible
+    /// rows — pruning by visibility would reset user fold state for nodes
+    /// that are merely collapsed away, filtered out, or inactive.
     pub fn retain_ids(&mut self, live: &HashSet<NodeId>) {
         self.expanded_overrides.retain(|id, _| live.contains(id));
     }
@@ -215,6 +218,25 @@ impl TreeState {
     }
 }
 
+/// Every expandable node id that EXISTS in the given snapshots — independent
+/// of expansion, the name filter, and the active-only scope. This is the set
+/// expansion overrides are retained against (only repo and branch nodes are
+/// expandable, so only their ids matter).
+pub fn live_ids(repos: &[RepoSnapshot]) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    for snap in repos {
+        let repo = crate::home::snapshot::repo_key(snap);
+        ids.insert(NodeId::Repo { repo: repo.clone() });
+        for n in &snap.hierarchy.nodes {
+            ids.insert(NodeId::Branch {
+                repo: repo.clone(),
+                branch: n.name.clone(),
+            });
+        }
+    }
+    ids
+}
+
 /// Flatten one or more repos into visible rows, honoring active-only
 /// filtering, the branch-name filter, and expansion state.
 pub fn flatten<'a>(
@@ -257,6 +279,12 @@ fn flatten_repo<'a>(
         .iter()
         .enumerate()
         .filter(|(_, w)| !w.bare && w.branch_short().is_none())
+        .filter(|(_, w)| match query {
+            None => true,
+            Some(q) => {
+                w.display_name().to_lowercase().contains(q) || w.path.to_lowercase().contains(q)
+            }
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -627,6 +655,65 @@ mod tests {
         assert!(
             !n.contains(&"feat/b".to_string()),
             "non-matching siblings hidden"
+        );
+    }
+
+    #[test]
+    fn fold_state_survives_pruning_while_hidden() {
+        // Regression (review finding): collapsing a branch, then HIDING it
+        // (collapse its ancestor / filter / active-only) and pruning must NOT
+        // reset its fold — the node still exists.
+        let s = fixture();
+        let mut state = TreeState::default();
+        let rows = flatten(std::slice::from_ref(&s), &state, None);
+        let a_idx = rows
+            .iter()
+            .position(|r| matches!(&r.id, NodeId::Branch { branch, .. } if branch == "feat/a"))
+            .unwrap();
+        state.select_index(&rows, a_idx);
+        state.collapse_selected(&rows); // fold feat/a's files away
+
+        // Collapse the repo row → feat/a becomes invisible.
+        let rows = flatten(std::slice::from_ref(&s), &state, None);
+        state.select_index(&rows, 0);
+        state.collapse_selected(&rows);
+
+        // The snapshot-refresh prune: existence-based, so the fold survives.
+        state.retain_ids(&live_ids(std::slice::from_ref(&s)));
+
+        // Re-expand the repo: feat/a must still be folded (no file rows).
+        let rows = flatten(std::slice::from_ref(&s), &state, None);
+        state.select_index(&rows, 0);
+        state.expand_selected(&rows);
+        let rows = flatten(std::slice::from_ref(&s), &state, None);
+        assert!(
+            !names(&rows).iter().any(|n| n.starts_with("file:")),
+            "feat/a's collapse override must survive being hidden"
+        );
+    }
+
+    #[test]
+    fn filter_applies_to_detached_worktrees_too() {
+        let mut s = fixture();
+        s.worktrees.push(WorktreeRecord {
+            path: "/repo-det".into(),
+            detached: true,
+            head: Some("abcdef12".into()),
+            ..Default::default()
+        });
+        let state = TreeState::default();
+        let rows = flatten(std::slice::from_ref(&s), &state, Some("feat/a"));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.kind, RowKind::Detached { .. })),
+            "a non-matching detached worktree is filtered out"
+        );
+        let rows = flatten(std::slice::from_ref(&s), &state, Some("detached"));
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.kind, RowKind::Detached { .. })),
+            "a matching detached worktree stays"
         );
     }
 
