@@ -11,6 +11,7 @@ pub mod cli;
 pub mod collision;
 pub mod config;
 pub mod git;
+pub mod help;
 pub mod home;
 pub mod live;
 pub mod notifications;
@@ -18,6 +19,7 @@ pub mod process;
 pub mod storage;
 pub mod terminal;
 pub mod ui;
+pub mod uninstall;
 pub mod update;
 pub mod util;
 
@@ -46,6 +48,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     // pure-JSON stdout contract.
     if let Some(Command::Agent) = &cli.command {
         return run_agent(&cli).await;
+    }
+
+    // `wb300 help`: the full manual, no TUI.
+    if let Some(Command::Help) = &cli.command {
+        std::process::exit(help::run(!cli.no_color));
+    }
+
+    // `wb300 uninstall`: plain CLI flow, no TUI.
+    if let Some(Command::Uninstall(args)) = &cli.command {
+        std::process::exit(uninstall::run(args));
     }
 
     terminal::install_panic_hook()?;
