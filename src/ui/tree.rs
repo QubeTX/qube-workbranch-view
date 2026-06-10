@@ -50,7 +50,7 @@ fn tree_item<'a>(
                     .bold()
                     .fg(theme::ACCENT),
             ];
-            let status = vec![
+            let mut status = vec![
                 Span::from(format!("{branch_total} branches")).fg(theme::DIM),
                 Span::from(" · ").fg(theme::DIM),
                 Span::from(format!("{agent_total} agents")).fg(if *agent_total > 0 {
@@ -59,6 +59,17 @@ fn tree_item<'a>(
                     theme::DIM
                 }),
             ];
+            // Per-repo capture staleness: silent while fresh, loud when this
+            // repo's data hasn't been recaptured in a while.
+            if snap.captured_at > 0 {
+                let age = crate::storage::events::epoch_secs().saturating_sub(snap.captured_at);
+                if age > 60 {
+                    status.push(
+                        Span::from(format!("  ⚠ stale {}", super::util::human_dur(age)))
+                            .fg(theme::COLLISION),
+                    );
+                }
+            }
             ListItem::new(with_status_column(left, status, width))
         }
         RowKind::Branch {

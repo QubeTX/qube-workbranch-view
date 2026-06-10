@@ -14,7 +14,7 @@ use super::tree::tree_items;
 use super::util::{field, human_dur, human_mem, label, reason_or_yes, render_placeholder};
 use crate::app::AppState;
 use crate::app::tree::{NodeId, RowKind, TreeRow};
-use crate::git::{BranchNode, WorktreeRecord};
+use crate::git::{BranchNode, RepoSnapshot, WorktreeRecord};
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
     let rows = app.tree_rows();
@@ -57,12 +57,39 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_stateful_widget(list, list_area, &mut state);
 
     let selected = app.tree.selected_index(&rows).and_then(|i| rows.get(i));
-    render_details(frame, detail_area, app, selected);
+    render_details(
+        frame,
+        detail_area,
+        std::slice::from_ref(&app.snapshot),
+        selected,
+    );
 }
 
-fn render_details(frame: &mut Frame, area: Rect, app: &AppState, row: Option<&TreeRow>) {
+/// Find the snapshot a tree node belongs to (every [`NodeId`] carries its
+/// repo key). Shared by the per-repo and machine-wide views.
+fn snap_for<'a>(repos: &'a [RepoSnapshot], id: &NodeId) -> Option<&'a RepoSnapshot> {
+    let key = match id {
+        NodeId::Repo { repo }
+        | NodeId::Branch { repo, .. }
+        | NodeId::Detached { repo, .. }
+        | NodeId::File { repo, .. } => repo,
+    };
+    repos
+        .iter()
+        .find(|r| crate::home::snapshot::repo_key(r) == *key)
+}
+
+/// The right-hand details pane for the selected tree node. `repos` is the
+/// snapshot set the rows were flattened from (one element in per-repo mode).
+pub(crate) fn render_details(
+    frame: &mut Frame,
+    area: Rect,
+    repos: &[RepoSnapshot],
+    row: Option<&TreeRow>,
+) {
     let block = Block::bordered().title(" Details ");
-    let Some(row) = row else {
+    let snap = row.and_then(|r| snap_for(repos, &r.id));
+    let (Some(row), Some(snap)) = (row, snap) else {
         frame.render_widget(Paragraph::new("Nothing selected.").block(block), area);
         return;
     };
@@ -81,9 +108,9 @@ fn render_details(frame: &mut Frame, area: Rect, app: &AppState, row: Option<&Tr
             ),
             field("worktrees", snap.worktrees.len().to_string()),
         ],
-        RowKind::Branch { node, .. } => branch_details(app, node),
+        RowKind::Branch { node, .. } => branch_details(snap, node),
         RowKind::Detached { wt, .. } => detached_details(wt),
-        RowKind::File { file } => file_details(app, row, file),
+        RowKind::File { file } => file_details(snap, row, file),
         RowKind::FileOverflow { hidden } => vec![field("hidden", format!("{hidden} more files"))],
     };
     frame.render_widget(
@@ -94,7 +121,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &AppState, row: Option<&Tr
     );
 }
 
-fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
+fn branch_details(snap: &RepoSnapshot, node: &BranchNode) -> Vec<Line<'static>> {
     let mut lines = vec![
         field("branch", node.name.clone()),
         field("role", node.role.as_str().to_string()),
@@ -104,7 +131,7 @@ fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
         ),
         field("stage", node.lifecycle.as_str().to_string()),
     ];
-    match node.worktree.and_then(|i| app.snapshot.worktrees.get(i)) {
+    match node.worktree.and_then(|i| snap.worktrees.get(i)) {
         Some(wt) => {
             lines.push(field("worktree", wt.path.clone()));
             if let Some(s) = &wt.status {
@@ -157,7 +184,7 @@ fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
         ));
     }
     if let Some(idx) = node.worktree
-        && let Some(agent) = app.snapshot.processes.agent_for_worktree(idx)
+        && let Some(agent) = snap.processes.agent_for_worktree(idx)
     {
         lines.push(field(
             "agent",
@@ -172,8 +199,7 @@ fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
         ));
     }
     // Tip subject + date from the ref scan.
-    if let Some(info) = app
-        .snapshot
+    if let Some(info) = snap
         .branches
         .iter()
         .find(|b| !b.is_remote && b.short == node.name)
@@ -187,8 +213,7 @@ fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
     }
     // Merge-conflict risks involving this branch's worktree.
     if let Some(idx) = node.worktree {
-        let risks: Vec<String> = app
-            .snapshot
+        let risks: Vec<String> = snap
             .collisions
             .iter()
             .filter(|c| c.worktrees.contains(&idx))
@@ -197,7 +222,7 @@ fn branch_details(app: &AppState, node: &BranchNode) -> Vec<Line<'static>> {
                     .worktrees
                     .iter()
                     .filter(|&&i| i != idx)
-                    .filter_map(|&i| app.snapshot.worktrees.get(i))
+                    .filter_map(|&i| snap.worktrees.get(i))
                     .map(WorktreeRecord::display_name)
                     .collect();
                 format!("{} (also on {})", c.file, others.join(", "))
@@ -241,7 +266,7 @@ fn detached_details(wt: &WorktreeRecord) -> Vec<Line<'static>> {
 }
 
 fn file_details(
-    app: &AppState,
+    snap: &RepoSnapshot,
     row: &TreeRow,
     file: &crate::git::FileChange,
 ) -> Vec<Line<'static>> {
@@ -254,11 +279,11 @@ fn file_details(
         field("change", file.kind.as_str().to_string()),
         field("branch", branch),
     ];
-    if let Some(c) = app.snapshot.collisions.iter().find(|c| c.file == file.path) {
+    if let Some(c) = snap.collisions.iter().find(|c| c.file == file.path) {
         let others: Vec<String> = c
             .worktrees
             .iter()
-            .filter_map(|&i| app.snapshot.worktrees.get(i))
+            .filter_map(|&i| snap.worktrees.get(i))
             .map(WorktreeRecord::display_name)
             .collect();
         lines.push(Line::from(vec![

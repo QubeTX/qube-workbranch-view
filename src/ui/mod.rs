@@ -231,19 +231,6 @@ pub(crate) fn milestone_color(kind: Option<TransitionKind>) -> Option<Color> {
     }
 }
 
-/// The leading live-activity dot for a worktree row, in its own colour: blue ◆
-/// while editing, ✚ created, ⌫ removed, dim · when idle. Milestones recolor the
-/// whole row instead (see [`milestone_color`]), so the dot just dims for those.
-/// Used by the home view (until it converges on the tree).
-pub(crate) fn activity_dot(transition: Option<TransitionKind>) -> Span<'static> {
-    match transition {
-        Some(TransitionKind::Activity) => Span::from("◆ ").fg(theme::ACTIVITY),
-        Some(TransitionKind::Created) => Span::from("✚ ").fg(Color::Cyan),
-        Some(TransitionKind::Deleted) => Span::from("⌫ ").fg(theme::COLLISION),
-        _ => Span::from("· ").fg(theme::DIM),
-    }
-}
-
 /// Compact dirty/divergence badges for a worktree row. Shared by the detached
 /// rows in the tree and the home view.
 pub(crate) fn status_badges(status: Option<&WorktreeStatus>) -> Vec<Span<'static>> {
