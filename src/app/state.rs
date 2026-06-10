@@ -328,31 +328,7 @@ impl AppState {
                     new_events.push(event_from(EventKind::WorktreeRemoved, old));
                 }
             }
-            // New merge-conflict-risk pairings (a file changed on a worktree SET
-            // not flagged last snapshot) → log once. Keyed by file + the worktree
-            // paths involved, so a re-paired conflict (A×B → A×C) re-logs.
-            let old_conflicts: HashSet<String> = self
-                .snapshot
-                .collisions
-                .iter()
-                .map(|c| conflict_key(c, &self.snapshot.worktrees))
-                .collect();
-            for c in &new.collisions {
-                if !old_conflicts.contains(&conflict_key(c, &new.worktrees)) {
-                    let who: Vec<String> = c
-                        .worktrees
-                        .iter()
-                        .filter_map(|&i| new.worktrees.get(i).map(WorktreeRecord::display_name))
-                        .collect();
-                    new_events.push(ArchivedEvent::new(
-                        EventKind::ConflictRisk,
-                        c.file.clone(),
-                        Some(who.join(" × ")),
-                        None,
-                        None,
-                    ));
-                }
-            }
+            new_events.extend(conflict_events(&self.snapshot, &new));
             // Branch milestones (commit / push / merge), diffed on the
             // hierarchy. These feed the Timeline and OS notifications.
             new_events.extend(branch_events(&self.snapshot, &new, None));
@@ -901,6 +877,36 @@ pub(crate) fn change_kind(old: &WorktreeRecord, new: &WorktreeRecord) -> Vec<Tra
         return vec![TransitionKind::Committed];
     }
     Vec::new()
+}
+
+/// New merge-conflict-risk pairings (a file changed on a worktree SET not
+/// flagged in the previous snapshot) → one event each. Keyed by file + the
+/// worktree paths involved, so a re-paired conflict (A×B → A×C) re-logs.
+/// Shared by the per-repo and home reducers.
+pub(crate) fn conflict_events(old: &RepoSnapshot, new: &RepoSnapshot) -> Vec<ArchivedEvent> {
+    let old_conflicts: HashSet<String> = old
+        .collisions
+        .iter()
+        .map(|c| conflict_key(c, &old.worktrees))
+        .collect();
+    let mut out = Vec::new();
+    for c in &new.collisions {
+        if !old_conflicts.contains(&conflict_key(c, &new.worktrees)) {
+            let who: Vec<String> = c
+                .worktrees
+                .iter()
+                .filter_map(|&i| new.worktrees.get(i).map(WorktreeRecord::display_name))
+                .collect();
+            out.push(ArchivedEvent::new(
+                EventKind::ConflictRisk,
+                c.file.clone(),
+                Some(who.join(" × ")),
+                None,
+                None,
+            ));
+        }
+    }
+    out
 }
 
 /// Max touched paths carried with a commit-milestone event.
