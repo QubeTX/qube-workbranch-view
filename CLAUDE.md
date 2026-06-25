@@ -42,14 +42,18 @@ KeyEvent → resolve_key → Action → AppState::apply (reducer)
 - **Terminal restoration is unconditional** — `terminal::TerminalGuard` (RAII) + the panic hook
   from `terminal::install_panic_hook` restore raw mode / the alternate screen on every exit.
 
-Module layout: `app/` (state, action, reducer, `tree.rs` — tree state + flatten), `git/`
-(snapshot pipeline, `hierarchy.rs` — topology-derived branch tree, `lifecycle.rs` — the
-per-branch stage table), `ui/` (per-tab modules: `branches`/`tree` render the hierarchy;
+Module layout (`src/`, all declared in `lib.rs`): `app/` (state, action, reducer, `tree.rs` —
+tree state + flatten), `git/` (snapshot pipeline, `hierarchy.rs` — topology-derived branch
+tree, `lifecycle.rs` — the per-branch stage table), `home/` (multi-repo discovery + snapshot
+behind the machine-wide view), `ui/` (per-tab modules: `branches`/`tree` render the hierarchy;
 `processes`, `merge_risk`, `cleanup`, `timeline`, `overlays`, `home`), `live/` (watcher +
-debouncer), `process/` (scan + classify), `storage/` (events.jsonl), `notifications.rs`
-(toast policy + backends), `config.rs` (minimal TOML), `help.rs` (the `wb300 help` manual —
-keep it in sync with UI changes), `uninstall.rs`, `update.rs`, `terminal/` (guard + panic
-hook).
+debouncer), `process/` (scan + classify), `storage/` (events.jsonl), `agent.rs` (the
+`wb300 agent` headless JSON snapshot — the `wb300.agent.v2` contract), `collision.rs`
+(merge-conflict forecasting) and `cleanup.rs` (safe-cleanup scoring) — the engines the
+`merge_risk`/`cleanup` UI tabs render, `notifications.rs` (toast policy + backends),
+`config.rs` (minimal TOML), `cli.rs` (clap surface; `build.rs` `include!`s it for the man
+page), `help.rs` (the `wb300 help` manual — keep it in sync with UI changes), `uninstall.rs`,
+`update.rs`, `util/`, `terminal/` (guard + panic hook).
 
 ## Build & run
 
@@ -70,6 +74,23 @@ failure). Read `${PIPESTATUS[0]}` or run the command unpiped.
 MSRV is pinned to **1.95** in both `Cargo.toml` (`rust-version`) and `rust-toolchain.toml` —
 **bump both together**, never one alone.
 
+### Subcommands & headless mode
+
+`wb300` (no subcommand) opens the TUI; four subcommands run headless and exit:
+
+```sh
+wb300 agent              # print repo (or machine-wide) state as JSON and exit — no TUI
+wb300 help               # the full manual (src/help.rs), NOT clap's usage dump
+wb300 update [--json]    # registry-aware self-update (see "Windows distribution")
+wb300 uninstall [-y] [--purge] [--json]
+```
+
+`wb300 agent` (`src/agent.rs`) emits the **`wb300.agent.v2`** schema — a *stable* JSON contract
+that orchestrating agents and the downstream `wb300` skill consume. Treat it like the installer
+lockstep: adding fields is fine, but a breaking shape change must bump the schema (`v2` → `v3`).
+The global flags `--repo`, `--home`/`--multi`, and `--no-color` are accepted after a subcommand
+too; `--no-live` opens the TUI in static-snapshot mode (no live engine).
+
 ## Changelog rule (lockstep)
 
 Two changelogs, always updated in the **same commit**:
@@ -82,7 +103,7 @@ Never let one drift ahead of the other.
 
 ## Deploy a new version
 
-### Release prerequisites & gotchas (learned at v1.0.0)
+### Release prerequisites & gotchas (learned at v1.0.0–v2.0.0)
 
 - `crates-publish.yml` needs the **`CARGO_REGISTRY_TOKEN`** repo secret; without it the publish
   job fails fast. The tag-triggered GitHub release (`release.yml`) is unaffected by its absence.
@@ -93,6 +114,13 @@ Never let one drift ahead of the other.
   page matches Linux CI — confirm with `cargo publish --dry-run --locked` (no `--allow-dirty`).
 - First release of the crate: the version is already at the target, so skip `./deploy.sh bump`
   and `./deploy.sh tag` the current green commit directly.
+- `jq` is not installed on this machine — use `gh ... --jq` or PowerShell `ConvertFrom-Json`
+  (an external-jq pipeline inside a CI monitor fails silently: no events, then timeout).
+- A PowerShell safety hook blocks commands containing a literal `/I` — write PR bodies that
+  mention MSI flags to a temp file and use `gh pr create --body-file`.
+- `gh pr merge --delete-branch` can't delete branches checked out in worktrees and may exit
+  nonzero even when the merge succeeded — verify with `gh pr view --json state`, then remove
+  the worktree and delete the branch manually.
 
 The release model is **bump version → merge → push tag** (tag-triggered, cargo-dist-native, no
 accidental deploys). The full cycle:
@@ -135,7 +163,8 @@ When the operator says *"deploy a new version"*:
 #   → lockstep guard: hard-stops unless CHANGELOG.md has a `## [X.Y.Z]` section
 #     AND HUMAN_CHANGELOG.md changed since the last tag
 #   → runs fmt / clippy -D warnings / test --locked / publish --dry-run --locked
-#   → commits ONLY Cargo.toml, Cargo.lock, CHANGELOG.md, HUMAN_CHANGELOG.md
+#   → commits ONLY Cargo.toml, Cargo.lock, CHANGELOG.md, HUMAN_CHANGELOG.md,
+#     man/wb300.1 (build.rs regenerates it with the new version string)
 #     (+ the Co-Authored-By trailer) and pushes the branch
 # Then YOU merge the PR to main (the gate). crates-publish.yml runs.
 
@@ -157,6 +186,10 @@ change: its version badge is fetched live (`useGitHubVersion('QubeTX/qube-workbr
 and its install links point at `releases/latest/download/…` — both version-agnostic. Update the
 homepage **only** when something **outward-facing** changes: new features, new/changed install
 methods, renamed commands/flags, a new tagline, or new screenshots.
+
+The live site is `reports.qubetx.com` (not qubetx.com); merging to its `main` auto-deploys on
+Vercel. To confirm a deploy landed, compare the local `dist/assets/index-*.js` bundle hash
+against the served HTML (the SPA shell carries no page content, so grep for the hash, not copy).
 
 ## Windows distribution
 
