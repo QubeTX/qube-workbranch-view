@@ -43,3 +43,6 @@ coverage/
 .claude/settings.local.json
 # Claude Code runtime artifacts: per-session lock from ScheduleWakeup, etc.
 .claude/*.lock
+
+# Claude Code / build session transcripts — may capture secrets (e.g. tokens). Never commit.
+/build.txt
